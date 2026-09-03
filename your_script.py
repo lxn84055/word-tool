@@ -9,37 +9,21 @@ from openpyxl import Workbook, load_workbook
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QListWidget, QListWidgetItem, QLabel,
-    QComboBox, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
+    QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
     QTabWidget, QLineEdit, QMessageBox, QProgressBar, QTextEdit,
     QSplitter, QGroupBox, QFormLayout, QDialog, QDialogButtonBox
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt
 
 # ================== 辅助函数 ==================
 
-def get_paragraph_font_info(para):
-    """获取段落中第一个 run 的字号和加粗状态"""
-    size = None
-    bold = False
-    for run in para.runs:
-        if run.font.size is not None:
-            size = run.font.size.pt
-        if run.font.bold is not None:
-            bold = run.font.bold
-        if size is not None and run.font.bold is not None:
-            break
-    # 如果没找到，尝试段落样式
-    if size is None:
-        style = para.style
-        if style.font.size is not None:
-            size = style.font.size.pt
-    return size, bold
-
-def is_heading_paragraph(para, base_font_size=10.5, threshold=1.0):
+def is_heading_paragraph(para):
     """
     判断段落是否为标题，返回 (是否, 层级)
-    base_font_size: 正文基准字号（五号=10.5pt）
-    threshold: 字号大于 base_font_size * threshold 才可能被识别为无编号标题
+    完全依据编号样式识别，不依赖字体格式。
+    支持：
+    1. 数字编号：1, 1.1, 1.1.1
+    2. 中文序号：一、 二、 （一） 1） 等
     """
     text = para.text.strip()
     if not text:
@@ -51,26 +35,19 @@ def is_heading_paragraph(para, base_font_size=10.5, threshold=1.0):
         level = min(len(parts), 3)
         return True, level
 
-    # 2. 中文序号：一、 二、 （一） 1） 等
+    # 2. 中文序号
+    # 一级：一、 二、 三、
     if re.match(r'^[一二三四五六七八九十百千]+、', text):
         return True, 1
+    # 二级：（一） （二）
     if re.match(r'^（[一二三四五六七八九十百千]+）', text):
         return True, 2
+    # 二级：1） 2）
     if re.match(r'^\d+）', text):
         return True, 2
-
-    # 3. 无编号但字体突出：加粗且字号大于正文
-    size, bold = get_paragraph_font_info(para)
-    if size is not None and bold:
-        if size > base_font_size * threshold + 3:   # 比正文大3pt以上，视为一级
-            return True, 1
-        elif size > base_font_size * threshold + 1.5:  # 大1.5pt以上，视为二级
-            return True, 2
-        elif size > base_font_size * threshold:     # 略大，视为三级
-            return True, 3
-        else:
-            # 加粗但字号不大，可能只是强调，不算标题
-            return False, 0
+    # 三级：① ② 等
+    if re.match(r'^[①-⑩]', text):
+        return True, 3
 
     return False, 0
 
@@ -161,23 +138,6 @@ class MainWindow(QMainWindow):
         self.btn_scan = QPushButton("扫描标题")
         self.btn_scan.clicked.connect(self.scan_headings)
         layout.addWidget(self.btn_scan)
-
-        # 正文基准字号设置
-        font_group = QGroupBox("标题识别设置")
-        font_layout = QFormLayout()
-        self.spin_base_font = QDoubleSpinBox()
-        self.spin_base_font.setRange(6, 30)
-        self.spin_base_font.setValue(10.5)
-        self.spin_base_font.setSuffix(" pt")
-        self.spin_base_font.setDecimals(1)
-        self.spin_threshold = QDoubleSpinBox()
-        self.spin_threshold.setRange(1.0, 2.0)
-        self.spin_threshold.setValue(1.0)
-        self.spin_threshold.setSingleStep(0.1)
-        font_layout.addRow("正文基准字号：", self.spin_base_font)
-        font_layout.addRow("字号阈值倍数：", self.spin_threshold)
-        font_group.setLayout(font_layout)
-        layout.addWidget(font_group)
 
         # 标题列表
         self.list_headings = QListWidget()
@@ -296,11 +256,9 @@ class MainWindow(QMainWindow):
             return
         self.headings = []
         self.list_headings.clear()
-        base_font = self.spin_base_font.value()
-        threshold = self.spin_threshold.value()
 
         for i, para in enumerate(self.doc.paragraphs):
-            is_heading, level = is_heading_paragraph(para, base_font, threshold)
+            is_heading, level = is_heading_paragraph(para)
             if is_heading:
                 self.headings.append((para, level, para.text.strip(), i))
                 item = QListWidgetItem(f"[{level}] {para.text.strip()}")
@@ -331,7 +289,7 @@ class MainWindow(QMainWindow):
         pos = self.combo_dir_pos.currentIndex()
         levels = self.spin_levels.value()
 
-        # 在文档开头插入目录（简化处理，所有情况都插入到开头）
+        # 在文档开头插入目录（简化处理）
         first_para = self.doc.paragraphs[0]
         new_para = first_para.insert_paragraph_before()
         add_toc(new_para, levels)
@@ -414,21 +372,37 @@ class MainWindow(QMainWindow):
 
         for i, (level, text) in enumerate(titles_to_fill):
             row = table.rows[i + 1]
-            match = re.match(r'^(\d+(\.\d+)*)\s+', text)
-            if match:
-                seq_text = match.group(1)
-            else:
-                # 尝试匹配中文序号
-                match_cn = re.match(r'^([一二三四五六七八九十百千]+、|（[一二三四五六七八九十百千]+）|\d+）)', text)
-                if match_cn:
-                    seq_text = match_cn.group(1)
-                else:
-                    seq_text = str(i+1)
+            # 提取编号部分
+            seq_text = self.extract_seq_text(text, i+1)
             row.cells[seq_col].text = seq_text
             row.cells[title_col].text = text
 
         self.doc.save(self.current_doc_path)
         QMessageBox.information(self, "完成", "表格填充完成并已保存")
+
+    def extract_seq_text(self, text, fallback_idx):
+        """从标题文本中提取序号部分"""
+        # 数字编号：1, 1.1
+        match = re.match(r'^(\d+(\.\d+)*)\s+', text)
+        if match:
+            return match.group(1)
+        # 中文序号：一、
+        match = re.match(r'^([一二三四五六七八九十百千]+、)', text)
+        if match:
+            return match.group(1)
+        # 中文括号序号：（一）
+        match = re.match(r'^(（[一二三四五六七八九十百千]+）)', text)
+        if match:
+            return match.group(1)
+        # 数字括号序号：1）
+        match = re.match(r'^(\d+）)', text)
+        if match:
+            return match.group(1)
+        # 圈号序号：①
+        match = re.match(r'^([①-⑩])', text)
+        if match:
+            return match.group(1)
+        return str(fallback_idx)
 
     # ================== Excel 导出导入 ==================
     def export_to_excel(self):
