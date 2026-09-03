@@ -17,42 +17,67 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 
 # ================== 辅助函数 ==================
 
-def is_heading_paragraph(para):
-    """判断段落是否为标题，返回 (是否, 层级)"""
+def get_paragraph_font_info(para):
+    """获取段落中第一个 run 的字号和加粗状态"""
+    size = None
+    bold = False
+    for run in para.runs:
+        if run.font.size is not None:
+            size = run.font.size.pt
+        if run.font.bold is not None:
+            bold = run.font.bold
+        if size is not None and run.font.bold is not None:
+            break
+    # 如果没找到，尝试段落样式
+    if size is None:
+        style = para.style
+        if style.font.size is not None:
+            size = style.font.size.pt
+    return size, bold
+
+def is_heading_paragraph(para, base_font_size=10.5, threshold=1.0):
+    """
+    判断段落是否为标题，返回 (是否, 层级)
+    base_font_size: 正文基准字号（五号=10.5pt）
+    threshold: 字号大于 base_font_size * threshold 才可能被识别为无编号标题
+    """
     text = para.text.strip()
     if not text:
         return False, 0
 
-    # 正则匹配编号：1, 1.1, 1.1.1, 第一章, 第1章 等
-    patterns = [
-        r'^(\d+(\.\d+)*)\s+',               # 1, 1.1, 1.1.1
-        r'^第[一二三四五六七八九十百千\d]+章\s*',  # 第一章
-    ]
-    for i, pat in enumerate(patterns):
-        if re.match(pat, text):
-            # 根据编号层级判断：数点数量+1
-            if i == 0:  # 数字编号
-                parts = text.split()[0].split('.')
-                level = len(parts)
-                # 最多三级
-                if level > 3:
-                    level = 3
-                return True, level
-            else:       # 第X章，视为一级
-                return True, 1
+    # 1. 数字编号：1, 1.1, 1.1.1
+    if re.match(r'^(\d+(\.\d+)*)\s+', text):
+        parts = text.split()[0].split('.')
+        level = min(len(parts), 3)
+        return True, level
 
-    # 辅助：如果段落有加粗且字号较大，也可能为标题（但这里以编号为主，此处仅作参考）
-    # 可以忽略，因为用户强调以编号为主
+    # 2. 中文序号：一、 二、 （一） 1） 等
+    if re.match(r'^[一二三四五六七八九十百千]+、', text):
+        return True, 1
+    if re.match(r'^（[一二三四五六七八九十百千]+）', text):
+        return True, 2
+    if re.match(r'^\d+）', text):
+        return True, 2
+
+    # 3. 无编号但字体突出：加粗且字号大于正文
+    size, bold = get_paragraph_font_info(para)
+    if size is not None and bold:
+        if size > base_font_size * threshold + 3:   # 比正文大3pt以上，视为一级
+            return True, 1
+        elif size > base_font_size * threshold + 1.5:  # 大1.5pt以上，视为二级
+            return True, 2
+        elif size > base_font_size * threshold:     # 略大，视为三级
+            return True, 3
+        else:
+            # 加粗但字号不大，可能只是强调，不算标题
+            return False, 0
+
     return False, 0
 
 def set_heading_style(paragraph, level):
     """将段落设置为内置标题样式"""
     style_name = f'Heading {level}'
     paragraph.style = paragraph.part.document.styles[style_name]
-    # 可选：保留原有字体格式
-    # for run in paragraph.runs:
-    #     run.font.name = 'Calibri'
-    #     run.font.size = Pt(14 - level)  # 简单调整
 
 def add_toc(paragraph, levels=3):
     """在指定段落插入目录域"""
@@ -76,9 +101,7 @@ def add_toc(paragraph, levels=3):
     run._r.append(fldChar3)
 
 def get_table_name(table, doc, index):
-    """尝试获取表格名称：查找表格上方最近的段落中包含 '表' 或 'Table' 的文字"""
-    # 通过遍历文档元素，找到表格之前的段落
-    # 简化处理：返回 "表格 {index+1}"
+    """尝试获取表格名称：简化返回表格序号"""
     return f"表格 {index+1}"
 
 # ================== 主窗口 ==================
@@ -139,6 +162,23 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.scan_headings)
         layout.addWidget(self.btn_scan)
 
+        # 正文基准字号设置
+        font_group = QGroupBox("标题识别设置")
+        font_layout = QFormLayout()
+        self.spin_base_font = QDoubleSpinBox()
+        self.spin_base_font.setRange(6, 30)
+        self.spin_base_font.setValue(10.5)
+        self.spin_base_font.setSuffix(" pt")
+        self.spin_base_font.setDecimals(1)
+        self.spin_threshold = QDoubleSpinBox()
+        self.spin_threshold.setRange(1.0, 2.0)
+        self.spin_threshold.setValue(1.0)
+        self.spin_threshold.setSingleStep(0.1)
+        font_layout.addRow("正文基准字号：", self.spin_base_font)
+        font_layout.addRow("字号阈值倍数：", self.spin_threshold)
+        font_group.setLayout(font_layout)
+        layout.addWidget(font_group)
+
         # 标题列表
         self.list_headings = QListWidget()
         self.list_headings.setSelectionMode(QListWidget.MultiSelection)
@@ -149,7 +189,7 @@ class MainWindow(QMainWindow):
         group_dir = QGroupBox("生成目录")
         dir_layout = QFormLayout()
         self.combo_dir_pos = QComboBox()
-        self.combo_dir_pos.addItems(["文档开头", "指定页码", "替换现有目录"])
+        self.combo_dir_pos.addItems(["文档开头", "指定页码（近似）", "替换现有目录（手动删除旧目录）"])
         self.spin_page = QSpinBox()
         self.spin_page.setRange(1, 1000)
         self.spin_page.setValue(1)
@@ -256,13 +296,17 @@ class MainWindow(QMainWindow):
             return
         self.headings = []
         self.list_headings.clear()
+        base_font = self.spin_base_font.value()
+        threshold = self.spin_threshold.value()
+
         for i, para in enumerate(self.doc.paragraphs):
-            is_heading, level = is_heading_paragraph(para)
+            is_heading, level = is_heading_paragraph(para, base_font, threshold)
             if is_heading:
                 self.headings.append((para, level, para.text.strip(), i))
                 item = QListWidgetItem(f"[{level}] {para.text.strip()}")
-                item.setData(Qt.UserRole, len(self.headings)-1)  # 存储索引
+                item.setData(Qt.UserRole, len(self.headings)-1)
                 self.list_headings.addItem(item)
+
         if not self.headings:
             QMessageBox.information(self, "提示", "未识别到标题")
         else:
@@ -287,29 +331,13 @@ class MainWindow(QMainWindow):
         pos = self.combo_dir_pos.currentIndex()
         levels = self.spin_levels.value()
 
-        if pos == 0:  # 文档开头
-            # 在第一个段落前插入
-            first_para = self.doc.paragraphs[0]
-            new_para = first_para.insert_paragraph_before()
-            add_toc(new_para, levels)
-        elif pos == 1:  # 指定页码
-            page = self.spin_page.value()
-            # 简化：无法准确获取页码，使用段落位置近似
-            # 这里提示用户实际页码可能不准确
-            QMessageBox.information(self, "提示", "指定页码功能为近似实现，将在文档前部插入目录，请手动调整位置。")
-            first_para = self.doc.paragraphs[0]
-            new_para = first_para.insert_paragraph_before()
-            add_toc(new_para, levels)
-        else:  # 替换现有目录
-            # 查找现有目录域并替换（简化：删除第一个TOC域，插入新目录）
-            # 此处简单实现：在第一个段落前插入新的目录，并提示用户删除旧目录
-            QMessageBox.information(self, "提示", "请手动删除旧目录后重新插入。")
-            first_para = self.doc.paragraphs[0]
-            new_para = first_para.insert_paragraph_before()
-            add_toc(new_para, levels)
+        # 在文档开头插入目录（简化处理，所有情况都插入到开头）
+        first_para = self.doc.paragraphs[0]
+        new_para = first_para.insert_paragraph_before()
+        add_toc(new_para, levels)
 
         self.doc.save(self.current_doc_path)
-        QMessageBox.information(self, "完成", "目录已插入，请在 Word 中更新域以显示页码")
+        QMessageBox.information(self, "完成", "目录已插入到文档开头，请在 Word 中更新域以显示页码")
 
     # ================== 表格填充 ==================
     def list_tables(self):
@@ -332,15 +360,12 @@ class MainWindow(QMainWindow):
         if table_idx is None:
             return
         table = self.doc.tables[table_idx]
-        # 填充列选择下拉框
         self.combo_seq_col.clear()
         self.combo_title_col.clear()
-        # 获取表头（第一行）
         headers = []
         if len(table.rows) > 0:
             for cell in table.rows[0].cells:
                 headers.append(cell.text.strip())
-        # 添加列号选项
         for col_idx in range(len(table.columns)):
             if headers and col_idx < len(headers):
                 label = f"{col_idx+1} - {headers[col_idx]}" if headers[col_idx] else f"列 {col_idx+1}"
@@ -363,7 +388,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请指定列")
             return
 
-        # 根据勾选层级收集标题
         levels_wanted = []
         if self.check_level1.isChecked():
             levels_wanted.append(1)
@@ -382,29 +406,25 @@ class MainWindow(QMainWindow):
             return
 
         table = self.doc.tables[table_idx]
-        # 确保表格有足够行：现有数据行数（除表头）与标题数量比较
-        # 假设第一行是表头
         data_rows = len(table.rows) - 1
         needed_rows = len(titles_to_fill)
         if data_rows < needed_rows:
-            # 添加行
             for _ in range(needed_rows - data_rows):
                 table.add_row()
-        # 填充
+
         for i, (level, text) in enumerate(titles_to_fill):
-            row = table.rows[i + 1]  # 跳过表头
-            # 序号列：写入完整编号（从文本中提取编号部分）
-            # 标题文本中已经包含编号，可以直接用
-            # 但若需区分层级，可以增加缩进，这里直接使用完整文本
-            # 我们写入序号列：提取文本开头的编号
+            row = table.rows[i + 1]
             match = re.match(r'^(\d+(\.\d+)*)\s+', text)
             if match:
                 seq_text = match.group(1)
             else:
-                # 没有编号则用序号
-                seq_text = str(i+1)
+                # 尝试匹配中文序号
+                match_cn = re.match(r'^([一二三四五六七八九十百千]+、|（[一二三四五六七八九十百千]+）|\d+）)', text)
+                if match_cn:
+                    seq_text = match_cn.group(1)
+                else:
+                    seq_text = str(i+1)
             row.cells[seq_col].text = seq_text
-            # 标题列：写入完整标题（含编号）
             row.cells[title_col].text = text
 
         self.doc.save(self.current_doc_path)
@@ -418,7 +438,6 @@ class MainWindow(QMainWindow):
         if not self.doc.tables:
             QMessageBox.warning(self, "警告", "文档中没有表格")
             return
-        # 弹出对话框选择要导出的表格（多选）
         dialog = QDialog(self)
         dialog.setWindowTitle("选择要导出的表格")
         layout = QVBoxLayout(dialog)
@@ -439,12 +458,11 @@ class MainWindow(QMainWindow):
         selected = [item.data(Qt.UserRole) for item in list_widget.selectedItems()]
         if not selected:
             return
-        # 选择保存路径
         save_path, _ = QFileDialog.getSaveFileName(self, "保存 Excel 文件", "", "Excel 文件 (*.xlsx)")
         if not save_path:
             return
         wb = Workbook()
-        wb.remove(wb.active)  # 删除默认工作表
+        wb.remove(wb.active)
         for idx in selected:
             table = self.doc.tables[idx]
             ws = wb.create_sheet(title=f"表格{idx+1}")
@@ -461,7 +479,6 @@ class MainWindow(QMainWindow):
         if not self.doc.tables:
             QMessageBox.warning(self, "警告", "文档中没有表格")
             return
-        # 选择 Excel 文件
         excel_path, _ = QFileDialog.getOpenFileName(self, "选择 Excel 文件", "", "Excel 文件 (*.xlsx)")
         if not excel_path:
             return
@@ -470,9 +487,7 @@ class MainWindow(QMainWindow):
         if not sheet_names:
             QMessageBox.warning(self, "警告", "Excel 文件为空")
             return
-        # 简单处理：选择第一个工作表
         ws = wb[sheet_names[0]]
-        # 获取数据（第一行为表头）
         headers = [cell.value for cell in ws[1]]
         data_rows = []
         for row in ws.iter_rows(min_row=2, values_only=True):
@@ -481,7 +496,6 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "Excel 没有数据")
             return
 
-        # 让用户选择目标 Word 表格和对应列
         dialog = QDialog(self)
         dialog.setWindowTitle("选择目标表格和列映射")
         layout = QFormLayout(dialog)
@@ -491,7 +505,6 @@ class MainWindow(QMainWindow):
         layout.addRow("目标表格：", combo_table)
 
         combo_word_col = QComboBox()
-        # 获取表头
         table_idx = combo_table.currentData()
         if table_idx is not None:
             table = self.doc.tables[table_idx]
@@ -524,13 +537,11 @@ class MainWindow(QMainWindow):
             return
 
         table = self.doc.tables[target_table_idx]
-        # 确保行数足够
         needed = len(data_rows)
         current_data_rows = len(table.rows) - 1
         if current_data_rows < needed:
             for _ in range(needed - current_data_rows):
                 table.add_row()
-        # 填充
         for i, row_data in enumerate(data_rows):
             value = row_data[excel_col]
             table.rows[i+1].cells[word_col].text = str(value) if value is not None else ""
