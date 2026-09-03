@@ -1,27 +1,4 @@
 import sys
-import sys
-import traceback
-import os
-
-# 错误捕获
-def show_error(exc_type, exc_value, exc_tb):
-    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
-    # 保存到桌面错误日志
-    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
-    with open(os.path.join(desktop, 'error_log.txt'), 'w', encoding='utf-8') as f:
-        f.write(error_msg)
-    # 弹窗显示错误
-    try:
-        from PyQt5.QtWidgets import QMessageBox, QApplication
-        app = QApplication.instance()
-        if app is None:
-            app = QApplication([])
-        QMessageBox.critical(None, "程序错误", error_msg[:500])
-    except:
-        pass
-    sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-sys.excepthook = show_error
 import re
 import os
 import tempfile
@@ -72,57 +49,72 @@ def convert_doc_to_docx(doc_path):
 
 MAX_LEVEL = 5
 
-def detect_number_format(text):
-    """检测标题文本中的编号格式"""
+def clean_title_text(text):
+    """清理标题文字：省略结尾非成对标点，保留右括号和？、！"""
     text = text.strip()
-    
-    # 中文序号：一、
-    match = re.match(r'^([一二三四五六七八九十百千]+)(、)\s*(.*)', text)
-    if match:
-        return ('chinese', '、', False, match.group(1), match.group(3))
-    
-    # 中文括号：（一）
-    match = re.match(r'^(（[一二三四五六七八九十百千]+）)\s*(.*)', text)
-    if match:
-        return ('chinese_paren', '', False, match.group(1), match.group(2))
-    
-    # 数字右括号：1）
-    match = re.match(r'^(\d+)(）)\s*(.*)', text)
-    if match:
-        return ('paren_digit', '）', False, match.group(1), match.group(3))
-    
-    # 圈号：①
-    match = re.match(r'^([①-⑩])\s*(.*)', text)
-    if match:
-        return ('circle', '', False, match.group(1), match.group(2))
-    
-    # 数字编号
-    match = re.match(r'^(\d+(?:\.\d+)*)([、.]?)\s*(.*)', text)
-    if match:
-        num_part = match.group(1)
-        sep = match.group(2)
-        rest = match.group(3)
-        if rest or sep:
-            return ('digit', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
-    
-    # 罗马数字编号
-    match = re.match(r'^([IVXLCivxlc]+(?:[.、](?:[IVXLCivxlc]+|\d+))*)([、.]?)\s*(.*)', text)
-    if match:
-        num_part = match.group(1)
-        sep = match.group(2)
-        rest = match.group(3)
-        if rest or sep:
-            return ('roman', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
-    
-    # 英文字母编号
-    match = re.match(r'^([A-Za-z](?:[.、](?:[A-Za-z]|\d+))*)([、.]?)\s*(.*)', text)
-    if match:
-        num_part = match.group(1)
-        sep = match.group(2)
-        rest = match.group(3)
-        if rest or sep:
-            return ('alpha', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
-    
+    if not text:
+        return text
+    # 需要省略的结尾标点
+    end_punctuation = '：:。；;，,、—…'
+    while text and text[-1] in end_punctuation:
+        text = text[:-1].rstrip()
+    return text
+
+def detect_number_format(text):
+    """检测标题文本中的编号格式，返回 (编号类型, 分隔符, 是否有空格, 编号部分, 标题文字)"""
+    text = text.strip()
+    # 1. 中文序号：一、 一. 一． 一 （一级）
+    m = re.match(r'^([一二三四五六七八九十百千]+)([、.．]?)\s{0,4}(.*)', text)
+    if m and (m.group(2) or m.group(3)):
+        return ('chinese', m.group(2) or '、', False, m.group(1), m.group(3))
+
+    # 2. 括号类型：（一） （1） （A） （I） 及半角
+    m = re.match(r'^[（(]([一二三四五六七八九十百千]+|\d+|[A-Za-z]+|[IVXLCivxlc]+)[）)]\s{0,4}(.*)', text)
+    if m:
+        inner = m.group(1)
+        rest = m.group(2)
+        if re.match(r'^[一二三四五六七八九十百千]+$', inner):
+            return ('chinese_paren', '', False, inner, rest)
+        elif re.match(r'^\d+$', inner):
+            return ('paren_digit', '', False, inner, rest)
+        elif re.match(r'^[A-Za-z]+$', inner):
+            return ('alpha_paren', '', False, inner, rest)
+        elif re.match(r'^[IVXLCivxlc]+$', inner):
+            return ('roman_paren', '', False, inner, rest)
+
+    # 3. 右括号结尾：1) 1） A) A） I) I）
+    m = re.match(r'^(\d+|[A-Za-z]+|[IVXLCivxlc]+)([)）])\s{0,4}(.*)', text)
+    if m:
+        num = m.group(1)
+        sep = m.group(2)
+        rest = m.group(3)
+        if num.isdigit():
+            return ('paren_digit', sep, False, num, rest)
+        elif re.match(r'^[A-Za-z]+$', num):
+            return ('alpha_paren', sep, False, num, rest)
+        elif re.match(r'^[IVXLCivxlc]+$', num):
+            return ('roman_paren', sep, False, num, rest)
+
+    # 4. 圈号：①
+    m = re.match(r'^([①-⑩])\s{0,4}(.*)', text)
+    if m:
+        return ('circle', '', False, m.group(1), m.group(2))
+
+    # 5. 数字编号：1、1.、1.1、1.1.、1．等
+    m = re.match(r'^(\d+(?:[.．]\d+)*)([、.．]?)\s{0,4}(.*)', text)
+    if m:
+        return ('digit', m.group(2), False, m.group(1), m.group(3))
+
+    # 6. 罗马数字编号
+    m = re.match(r'^([IVXLCivxlc]+(?:[.．、](?:[IVXLCivxlc]+|\d+))*)([、.．]?)\s{0,4}(.*)', text)
+    if m:
+        return ('roman', m.group(2), False, m.group(1), m.group(3))
+
+    # 7. 英文字母编号
+    m = re.match(r'^([A-Za-z](?:[.．、](?:[A-Za-z]|\d+))*)([、.．]?)\s{0,4}(.*)', text)
+    if m:
+        return ('alpha', m.group(2), False, m.group(1), m.group(3))
+
     return None
 
 def get_heading_level_from_style(para):
@@ -143,49 +135,85 @@ def get_heading_level_from_style(para):
         pass
     return None
 
+def is_toc_start(para):
+    """检测是否为目录标题"""
+    text = para.text.strip()
+    if not text:
+        return False
+    if text == '目录' or text.startswith('目录') or '目录' in text[:10]:
+        return True
+    if text.lower() in ['contents', 'table of contents']:
+        return True
+    return False
+
+def is_toc_end(para):
+    """检测目录区域是否结束"""
+    text = para.text.strip()
+    if not text:
+        return False
+    if get_heading_level_from_style(para) is not None:
+        return True
+    detected = detect_number_format(text)
+    if detected:
+        num_type, sep, has_space, num_part, rest = detected
+        title_text = clean_title_text(rest)
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
+        english_words = len(re.findall(r'[A-Za-z]+', title_text))
+        if chinese_chars <= 30 and english_words <= 20:
+            return True
+    return False
+
 def is_heading_paragraph(para):
-    """判断段落是否为标题"""
+    """判断段落是否为标题，返回 (是否, 层级)"""
     text = para.text.strip()
     if not text:
         return False, 0
-    
+
     # 1. 最高优先级：检查段落样式
     level = get_heading_level_from_style(para)
     if level is not None:
         return True, level
-    
+
     # 2. 检查编号格式
     detected = detect_number_format(text)
-    if detected:
-        num_type, sep, has_space, num_part, rest = detected
-        title_text = rest.strip()
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
-        english_words = len(re.findall(r'[A-Za-z]+', title_text))
-        
-        if chinese_chars > 30 or english_words > 20:
-            return False, 0
-        
-        if num_type == 'digit':
-            level = len(num_part.split('.'))
-        elif num_type == 'roman':
-            level = len(re.findall(r'[.、]', num_part)) + 1
-        elif num_type == 'alpha':
-            level = len(re.findall(r'[.、]', num_part)) + 1
-        elif num_type == 'chinese':
-            level = 1
-        elif num_type == 'chinese_paren':
-            level = 2
-        elif num_type == 'paren_digit':
-            level = 2
-        elif num_type == 'circle':
-            level = 3
+    if not detected:
+        return False, 0
+
+    num_type, sep, has_space, num_part, rest = detected
+    title_text = clean_title_text(rest)
+
+    # 只有编号本身（如 4.1）也视为标题
+    if not title_text:
+        if num_type in ('digit', 'roman', 'alpha'):
+            parts = re.findall(r'[.．]', num_part)
+            level = len(parts) + 1
+            return True, min(level, MAX_LEVEL)
         else:
-            level = 1
-        
-        level = min(level, MAX_LEVEL)
-        return True, level
-    
-    return False, 0
+            return False, 0
+
+    # 标题文字长度检查
+    chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
+    english_words = len(re.findall(r'[A-Za-z]+', title_text))
+    if chinese_chars > 30 or english_words > 20:
+        return False, 0
+
+    # 层级计算
+    if num_type == 'digit':
+        level = len(num_part.split('.'))
+    elif num_type == 'roman':
+        level = len(re.findall(r'[.．、]', num_part)) + 1
+    elif num_type == 'alpha':
+        level = len(re.findall(r'[.．、]', num_part)) + 1
+    elif num_type == 'chinese':
+        level = 1
+    elif num_type in ('chinese_paren', 'paren_digit', 'alpha_paren', 'roman_paren'):
+        level = 2
+    elif num_type == 'circle':
+        level = 3
+    else:
+        level = 1
+
+    return True, min(level, MAX_LEVEL)
 
 def int_to_roman(num):
     values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
@@ -217,7 +245,6 @@ def to_chinese_number(num):
     return str(num)
 
 def generate_number(num_type, level, counters, sep, has_space):
-    """根据编号类型和计数器生成编号"""
     if num_type == 'digit':
         nums = [str(counters[i]) for i in range(level)]
         num_str = '.'.join(nums)
@@ -349,6 +376,16 @@ class MainWindow(QMainWindow):
         self.btn_scan = QPushButton("扫描标题")
         self.btn_scan.clicked.connect(self.scan_headings)
         layout.addWidget(self.btn_scan)
+
+        # 跳过页数设置
+        skip_row = QHBoxLayout()
+        skip_row.addWidget(QLabel("跳过前几页："))
+        self.spin_skip_pages = QSpinBox()
+        self.spin_skip_pages.setRange(0, 20)
+        self.spin_skip_pages.setValue(1)
+        skip_row.addWidget(self.spin_skip_pages)
+        skip_row.addWidget(QLabel("页"))
+        layout.addLayout(skip_row)
 
         self.list_headings = QListWidget()
         self.list_headings.setSelectionMode(QListWidget.MultiSelection)
@@ -651,13 +688,42 @@ class MainWindow(QMainWindow):
             return
         self.headings = []
         self.list_headings.clear()
+        
+        skip_pages = self.spin_skip_pages.value()
+        in_toc = False
+        toc_skipped = False
+        skip_paragraphs = skip_pages * 40
+        
         for i, para in enumerate(self.doc.paragraphs):
+            if i < skip_paragraphs and not toc_skipped:
+                continue
+            
+            if not in_toc and is_toc_start(para):
+                in_toc = True
+                toc_skipped = True
+                continue
+            
+            if in_toc and is_toc_end(para):
+                in_toc = False
+            
+            if in_toc:
+                continue
+            
             is_heading, level = is_heading_paragraph(para)
             if is_heading:
-                self.headings.append((i, level, para.text.strip()))
-                item = QListWidgetItem(f"[{level}] {para.text.strip()}")
+                detected = detect_number_format(para.text.strip())
+                if detected:
+                    num_type, sep, has_space, num_part, rest = detected
+                    cleaned_text = clean_title_text(rest)
+                    display_text = f"{num_part}{sep} {cleaned_text}".strip() if cleaned_text else num_part
+                else:
+                    display_text = para.text.strip()
+                
+                self.headings.append((i, level, display_text))
+                item = QListWidgetItem(f"[{level}] {display_text}")
                 item.setData(Qt.UserRole, len(self.headings)-1)
                 self.list_headings.addItem(item)
+        
         if not self.headings:
             QMessageBox.information(self, "提示", "未识别到标题")
         else:
@@ -1103,8 +1169,8 @@ class MainWindow(QMainWindow):
         detected = detect_number_format(text)
         if detected:
             num_type, sep, has_space, num_part, rest = detected
-            return rest.strip()
-        return text.strip()
+            return clean_title_text(rest)
+        return clean_title_text(text)
 
     def set_paragraph_text(self, para, new_text):
         if para.runs:
