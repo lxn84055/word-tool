@@ -2,7 +2,6 @@ import sys
 import re
 import os
 import tempfile
-import shutil
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.oxml.ns import qn
@@ -22,7 +21,6 @@ from PyQt5.QtGui import QColor
 # ================== Word COM 检测与转换 ==================
 
 def check_word_available():
-    """检测系统中是否安装了 Microsoft Word"""
     try:
         import win32com.client
         word = win32com.client.Dispatch("Word.Application")
@@ -32,52 +30,237 @@ def check_word_available():
         return False
 
 def convert_doc_to_docx(doc_path):
-    """使用 Word COM 将 .doc 转换为 .docx，返回转换后的路径"""
     try:
         import win32com.client
         word = win32com.client.Dispatch("Word.Application")
         word.Visible = False
         doc = word.Documents.Open(doc_path)
-        # 创建临时文件
         temp_dir = tempfile.gettempdir()
         base_name = os.path.splitext(os.path.basename(doc_path))[0]
         docx_path = os.path.join(temp_dir, f"{base_name}_converted.docx")
-        # 另存为 docx（16 = docx 格式）
         doc.SaveAs2(docx_path, FileFormat=16)
         doc.Close()
         word.Quit()
         return docx_path
-    except Exception as e:
+    except:
         return None
 
-# ================== 辅助函数 ==================
+# ================== 编号格式检测与生成 ==================
+
+MAX_LEVEL = 5
+
+def detect_number_format(text):
+    """
+    检测标题文本中的编号格式
+    返回 (编号类型, 分隔符, 是否有空格, 编号部分, 标题文字)
+    编号类型: 'digit', 'roman', 'alpha', 'chinese', 'chinese_paren', 'paren_digit', 'circle'
+    """
+    text = text.strip()
+    
+    # 中文序号：一、
+    match = re.match(r'^([一二三四五六七八九十百千]+)(、)\s*(.*)', text)
+    if match:
+        return ('chinese', '、', False, match.group(1), match.group(3))
+    
+    # 中文括号：（一）
+    match = re.match(r'^(（[一二三四五六七八九十百千]+）)\s*(.*)', text)
+    if match:
+        return ('chinese_paren', '', False, match.group(1), match.group(2))
+    
+    # 数字右括号：1）
+    match = re.match(r'^(\d+)(）)\s*(.*)', text)
+    if match:
+        return ('paren_digit', '）', False, match.group(1), match.group(3))
+    
+    # 圈号：①
+    match = re.match(r'^([①-⑩])\s*(.*)', text)
+    if match:
+        return ('circle', '', False, match.group(1), match.group(2))
+    
+    # 数字编号：1 测试、1. 测试、1、测试、1.1 测试、1.1. 测试
+    match = re.match(r'^(\d+(?:\.\d+)*)([、.]?)\s*(.*)', text)
+    if match:
+        num_part = match.group(1)
+        sep = match.group(2)
+        rest = match.group(3)
+        if rest or sep:
+            return ('digit', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
+    
+    # 罗马数字编号：I. 测试、I 测试、I.I 测试
+    match = re.match(r'^([IVXLCivxlc]+(?:[.、](?:[IVXLCivxlc]+|\d+))*)([、.]?)\s*(.*)', text)
+    if match:
+        num_part = match.group(1)
+        sep = match.group(2)
+        rest = match.group(3)
+        if rest or sep:
+            return ('roman', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
+    
+    # 英文字母编号：A. 测试、A 测试、A.a 测试
+    match = re.match(r'^([A-Za-z](?:[.、](?:[A-Za-z]|\d+))*)([、.]?)\s*(.*)', text)
+    if match:
+        num_part = match.group(1)
+        sep = match.group(2)
+        rest = match.group(3)
+        if rest or sep:
+            return ('alpha', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
+    
+    return None
+
+def get_heading_level_from_style(para):
+    """从段落样式中获取标题层级"""
+    try:
+        style_name = para.style.name.lower()
+        if 'heading' in style_name:
+            # 提取数字
+            match = re.search(r'heading\s*(\d+)', style_name)
+            if match:
+                level = int(match.group(1))
+                return min(level, MAX_LEVEL)
+        # 中文样式名
+        if '标题' in style_name:
+            match = re.search(r'标题\s*(\d+)', style_name)
+            if match:
+                level = int(match.group(1))
+                return min(level, MAX_LEVEL)
+    except:
+        pass
+    return None
 
 def is_heading_paragraph(para):
-    """判断段落是否为标题"""
+    """判断段落是否为标题，返回 (是否, 层级)"""
     text = para.text.strip()
     if not text:
         return False, 0
-    if re.match(r'^(\d+(\.\d+)*)\s+', text):
-        parts = text.split()[0].split('.')
-        level = min(len(parts), 3)
+    
+    # 1. 最高优先级：检查段落样式
+    level = get_heading_level_from_style(para)
+    if level is not None:
         return True, level
-    if re.match(r'^[一二三四五六七八九十百千]+、', text):
-        return True, 1
-    if re.match(r'^（[一二三四五六七八九十百千]+）', text):
-        return True, 2
-    if re.match(r'^\d+）', text):
-        return True, 2
-    if re.match(r'^[①-⑩]', text):
-        return True, 3
+    
+    # 2. 检查编号格式
+    detected = detect_number_format(text)
+    if detected:
+        num_type, sep, has_space, num_part, rest = detected
+        # 计算标题文字长度
+        title_text = rest.strip()
+        # 中文标题长度检查：不超过30字
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
+        # 英文标题长度检查：不超过20个单词
+        english_words = len(re.findall(r'[A-Za-z]+', title_text))
+        
+        if chinese_chars > 30 or english_words > 20:
+            return False, 0
+        
+        # 计算层级
+        if num_type == 'digit':
+            level = len(num_part.split('.'))
+        elif num_type == 'roman':
+            level = len(re.findall(r'[.、]', num_part)) + 1
+        elif num_type == 'alpha':
+            level = len(re.findall(r'[.、]', num_part)) + 1
+        elif num_type == 'chinese':
+            level = 1
+        elif num_type == 'chinese_paren':
+            level = 2
+        elif num_type == 'paren_digit':
+            level = 2
+        elif num_type == 'circle':
+            level = 3
+        else:
+            level = 1
+        
+        level = min(level, MAX_LEVEL)
+        return True, level
+    
     return False, 0
+
+def roman_to_int(roman):
+    roman_values = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100}
+    result = 0
+    prev = 0
+    for char in reversed(roman.upper()):
+        value = roman_values.get(char, 0)
+        if value < prev:
+            result -= value
+        else:
+            result += value
+        prev = value
+    return result
+
+def int_to_roman(num):
+    values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
+    symbols = ['M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I']
+    result = ''
+    for i, value in enumerate(values):
+        while num >= value:
+            result += symbols[i]
+            num -= value
+    return result
+
+def int_to_alpha(num, upper=True):
+    result = ''
+    while num > 0:
+        num -= 1
+        char = chr(ord('A' if upper else 'a') + num % 26)
+        result = char + result
+        num //= 26
+    return result
+
+def to_chinese_number(num):
+    digits = ['零','一','二','三','四','五','六','七','八','九']
+    if num <= 10:
+        return digits[num] if num < 10 else '十'
+    elif num < 20:
+        return '十' + (digits[num%10] if num%10 else '')
+    elif num < 100:
+        return digits[num//10] + '十' + (digits[num%10] if num%10 else '')
+    return str(num)
+
+def generate_number(num_type, level, counters, sep, has_space):
+    """根据编号类型和计数器生成编号"""
+    if num_type == 'digit':
+        nums = [str(counters[i]) for i in range(level)]
+        num_str = '.'.join(nums)
+        if sep and level == 1:
+            num_str += sep
+        if has_space:
+            num_str += ' '
+        return num_str
+    elif num_type == 'roman':
+        nums = [int_to_roman(counters[i]) for i in range(level)]
+        num_str = sep.join(nums) if sep else '.'.join(nums)
+        if has_space:
+            num_str += ' '
+        return num_str
+    elif num_type == 'alpha':
+        nums = [int_to_alpha(counters[i]) for i in range(level)]
+        num_str = sep.join(nums) if sep else '.'.join(nums)
+        if has_space:
+            num_str += ' '
+        return num_str
+    elif num_type == 'chinese':
+        return to_chinese_number(counters[0]) + '、'
+    elif num_type == 'chinese_paren':
+        return '（' + to_chinese_number(counters[1]) + '）'
+    elif num_type == 'paren_digit':
+        return str(counters[1]) + '）'
+    elif num_type == 'circle':
+        circles = '①②③④⑤⑥⑦⑧⑨⑩'
+        return circles[min(counters[2]-1, 9)] if counters[2] <= 10 else str(counters[2])
+    else:
+        num_str = '.'.join(str(counters[i]) for i in range(level))
+        if has_space:
+            num_str += ' '
+        return num_str
 
 def set_heading_style(paragraph, level):
     try:
-        paragraph.style = paragraph.part.document.styles[f'Heading {level}']
+        style_name = f'Heading {min(level, 9)}'
+        paragraph.style = paragraph.part.document.styles[style_name]
     except:
         pass
 
-def add_toc(paragraph, levels=3):
+def add_toc(paragraph, levels=5):
     run = paragraph.add_run()
     fldChar = OxmlElement('w:fldChar')
     fldChar.set(qn('w:fldCharType'), 'begin')
@@ -128,7 +311,6 @@ class MainWindow(QMainWindow):
         self.current_doc_path = None
         self.doc = None
         self.headings = []
-        self.converted_temp_path = None  # 记录转换后的临时文件路径
         self.init_ui()
 
     def init_ui(self):
@@ -188,13 +370,18 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         level_row = QHBoxLayout()
-        level_row.addWidget(QLabel("调整选中标题层级为："))
+        level_row.addWidget(QLabel("调整选中标题层级："))
         self.combo_set_level = QComboBox()
-        self.combo_set_level.addItems(["一级", "二级", "三级"])
+        self.combo_set_level.addItems([f"{i}级" for i in range(1, MAX_LEVEL+1)])
         level_row.addWidget(self.combo_set_level)
-        self.btn_set_level = QPushButton("应用层级")
+        self.btn_set_level = QPushButton("设为指定层级")
         self.btn_set_level.clicked.connect(self.set_selected_level)
-        level_row.addWidget(self.btn_set_level)
+        self.btn_level_up = QPushButton("提高一级")
+        self.btn_level_up.clicked.connect(lambda: self.change_selected_level(-1))
+        self.btn_level_down = QPushButton("降低一级")
+        self.btn_level_down.clicked.connect(lambda: self.change_selected_level(1))
+        level_row.addWidget(self.btn_level_up)
+        level_row.addWidget(self.btn_level_down)
         layout.addLayout(level_row)
 
         self.btn_apply_style = QPushButton("将选中标题应用为 Word 标题样式")
@@ -206,21 +393,25 @@ class MainWindow(QMainWindow):
 
         level_select_row = QHBoxLayout()
         level_select_row.addWidget(QLabel("作用层级："))
-        self.check_unify_level1 = QCheckBox("一级")
-        self.check_unify_level1.setChecked(True)
-        self.check_unify_level2 = QCheckBox("二级")
-        self.check_unify_level2.setChecked(True)
-        self.check_unify_level3 = QCheckBox("三级")
-        self.check_unify_level3.setChecked(True)
-        level_select_row.addWidget(self.check_unify_level1)
-        level_select_row.addWidget(self.check_unify_level2)
-        level_select_row.addWidget(self.check_unify_level3)
+        self.check_unify_levels = []
+        for i in range(MAX_LEVEL):
+            check = QCheckBox(f"{i+1}级")
+            check.setChecked(True)
+            self.check_unify_levels.append(check)
+            level_select_row.addWidget(check)
         format_layout.addLayout(level_select_row)
 
         num_row = QHBoxLayout()
         num_row.addWidget(QLabel("编号样式："))
         self.combo_number_style = QComboBox()
-        self.combo_number_style.addItems(["数字编号：1, 1.1, 1.1.1", "中文序号：一、（一）、1）", "保持原编号"])
+        self.combo_number_style.addItems([
+            "与完美格式标题一致",
+            "数字编号：1, 1.1, 1.1.1",
+            "罗马数字：I, I.I, I.I.I",
+            "英文字母：A, A.a, A.a.a",
+            "中文序号：一、（一）、1）、①",
+            "保持原编号"
+        ])
         num_row.addWidget(self.combo_number_style)
         format_layout.addLayout(num_row)
 
@@ -320,14 +511,20 @@ class MainWindow(QMainWindow):
         group_dir = QGroupBox("生成目录")
         dir_layout = QFormLayout()
         self.spin_toc_levels = QSpinBox()
-        self.spin_toc_levels.setRange(1, 3)
-        self.spin_toc_levels.setValue(3)
+        self.spin_toc_levels.setRange(1, MAX_LEVEL)
+        self.spin_toc_levels.setValue(MAX_LEVEL)
         dir_layout.addRow("显示级别：", self.spin_toc_levels)
         self.btn_insert_toc = QPushButton("插入目录（含目录标题）")
         self.btn_insert_toc.clicked.connect(self.insert_toc)
         dir_layout.addRow(self.btn_insert_toc)
         group_dir.setLayout(dir_layout)
         layout.addWidget(group_dir)
+
+        # 生成新文件按钮
+        self.btn_generate = QPushButton("生成新 Word 文件")
+        self.btn_generate.clicked.connect(self.generate_new_document)
+        self.btn_generate.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-size: 14px; padding: 8px; }")
+        layout.addWidget(self.btn_generate)
 
     def init_tab2(self):
         layout = QVBoxLayout(self.tab2)
@@ -344,18 +541,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.combo_seq_col)
         layout.addWidget(QLabel("标题列："))
         layout.addWidget(self.combo_title_col)
+
         level_row = QHBoxLayout()
-        self.check_fill_l1 = QCheckBox("一级")
-        self.check_fill_l1.setChecked(True)
-        self.check_fill_l2 = QCheckBox("二级")
-        self.check_fill_l2.setChecked(True)
-        self.check_fill_l3 = QCheckBox("三级")
-        self.check_fill_l3.setChecked(True)
         level_row.addWidget(QLabel("填充层级："))
-        level_row.addWidget(self.check_fill_l1)
-        level_row.addWidget(self.check_fill_l2)
-        level_row.addWidget(self.check_fill_l3)
+        self.check_fill_levels = []
+        for i in range(MAX_LEVEL):
+            check = QCheckBox(f"{i+1}级")
+            check.setChecked(True)
+            self.check_fill_levels.append(check)
+            level_row.addWidget(check)
         layout.addLayout(level_row)
+
         self.btn_fill_table = QPushButton("填充表格")
         self.btn_fill_table.clicked.connect(self.fill_table)
         layout.addWidget(self.btn_fill_table)
@@ -386,16 +582,13 @@ class MainWindow(QMainWindow):
         if not file_path:
             return
 
-        # 检查文件类型
         ext = os.path.splitext(file_path)[1].lower()
         if ext == '.doc':
-            # 尝试用 Word 转换
             if check_word_available():
                 QMessageBox.information(self, "提示", "检测到 .doc 文件，正在使用 Word 转换...")
                 docx_path = convert_doc_to_docx(file_path)
                 if docx_path and os.path.exists(docx_path):
-                    self.converted_temp_path = docx_path
-                    self.current_doc_path = file_path  # 保留原始路径用于保存
+                    self.current_doc_path = file_path
                     self.doc = Document(docx_path)
                     self.lbl_file.setText(f"{file_path} (已自动转换为 .docx)")
                     self.statusBar().showMessage("已加载（通过 Word 转换）")
@@ -433,6 +626,26 @@ class MainWindow(QMainWindow):
                 return None
         return new_path
 
+    def generate_new_document(self):
+        """生成新 Word 文件（最终确认后）"""
+        if not self.doc:
+            QMessageBox.warning(self, "警告", "请先打开 Word 文档")
+            return
+        reply = QMessageBox.question(
+            self, "确认生成",
+            "确认所有设置已完成，生成新的 Word 文件？\n\n原文件不会被修改。",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+        new_path = self.get_new_save_path()
+        if new_path:
+            self.doc.save(new_path)
+            QMessageBox.information(self, "完成", f"新文件已生成：{new_path}")
+            self.current_doc_path = new_path
+            self.doc = Document(new_path)
+            self.scan_headings()
+
     # ================== 标题扫描与管理 ==================
     def scan_headings(self):
         if not self.doc:
@@ -457,9 +670,13 @@ class MainWindow(QMainWindow):
         act_add = menu.addAction("从段落中选取添加标题")
         act_delete = menu.addAction("删除选中标题")
         act_mark = menu.addAction("标记为非标题")
-        act_level1 = menu.addAction("设为一级标题")
-        act_level2 = menu.addAction("设为二级标题")
-        act_level3 = menu.addAction("设为三级标题")
+        menu.addSeparator()
+        for i in range(1, MAX_LEVEL+1):
+            action = menu.addAction(f"设为{i}级标题")
+            action.triggered.connect(lambda checked, level=i: self.set_selected_level_value(level))
+        menu.addSeparator()
+        act_up = menu.addAction("提高一级")
+        act_down = menu.addAction("降低一级")
         action = menu.exec_(self.list_headings.mapToGlobal(pos))
         if action == act_add:
             self.show_paragraph_picker()
@@ -467,12 +684,10 @@ class MainWindow(QMainWindow):
             self.delete_selected_headings()
         elif action == act_mark:
             self.mark_selected_as_non_heading()
-        elif action == act_level1:
-            self.set_selected_level_value(1)
-        elif action == act_level2:
-            self.set_selected_level_value(2)
-        elif action == act_level3:
-            self.set_selected_level_value(3)
+        elif action == act_up:
+            self.change_selected_level(-1)
+        elif action == act_down:
+            self.change_selected_level(1)
 
     def show_paragraph_picker(self):
         if not self.doc:
@@ -508,7 +723,7 @@ class MainWindow(QMainWindow):
         level_dialog.setWindowTitle("选择标题层级")
         level_layout = QFormLayout(level_dialog)
         combo_level = QComboBox()
-        combo_level.addItems(["一级", "二级", "三级"])
+        combo_level.addItems([f"{i}级" for i in range(1, MAX_LEVEL+1)])
         level_layout.addRow("层级：", combo_level)
         level_buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         level_buttons.accepted.connect(level_dialog.accept)
@@ -584,6 +799,18 @@ class MainWindow(QMainWindow):
             self.headings[idx] = (para_idx, level, text)
         self.refresh_heading_list()
 
+    def change_selected_level(self, delta):
+        selected_items = self.list_headings.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "警告", "请先选择标题")
+            return
+        for item in selected_items:
+            idx = item.data(Qt.UserRole)
+            para_idx, level, text = self.headings[idx]
+            new_level = max(1, min(MAX_LEVEL, level + delta))
+            self.headings[idx] = (para_idx, new_level, text)
+        self.refresh_heading_list()
+
     def refresh_heading_list(self):
         self.list_headings.clear()
         for i, (para_idx, level, text) in enumerate(self.headings):
@@ -600,10 +827,7 @@ class MainWindow(QMainWindow):
             idx = item.data(Qt.UserRole)
             para_idx, level, _ = self.headings[idx]
             set_heading_style(self.doc.paragraphs[para_idx], level)
-        new_path = self.get_new_save_path()
-        if new_path:
-            self.doc.save(new_path)
-            QMessageBox.information(self, "完成", f"新文件保存为：{new_path}")
+        self.statusBar().showMessage("已应用标题样式（点击"生成新 Word 文件"保存）")
 
     # ================== 格式统一与自动编号 ==================
     def pick_color(self):
@@ -615,12 +839,9 @@ class MainWindow(QMainWindow):
 
     def get_selected_levels(self):
         levels = []
-        if self.check_unify_level1.isChecked():
-            levels.append(1)
-        if self.check_unify_level2.isChecked():
-            levels.append(2)
-        if self.check_unify_level3.isChecked():
-            levels.append(3)
+        for i, check in enumerate(self.check_unify_levels):
+            if check.isChecked():
+                levels.append(i+1)
         return levels
 
     def get_paragraph_full_format(self, para, para_index):
@@ -772,7 +993,7 @@ class MainWindow(QMainWindow):
         if format_source == 0:
             selected_items = self.list_headings.selectedItems()
             if len(selected_items) != 1:
-                QMessageBox.warning(self, "警告", "请选择一个“完美格式”标题")
+                QMessageBox.warning(self, "警告", "请选择一个"完美格式"标题")
                 return
             source_idx = selected_items[0].data(Qt.UserRole)
             source_para_idx, source_level, _ = self.headings[source_idx]
@@ -788,69 +1009,105 @@ class MainWindow(QMainWindow):
 
         number_style = self.combo_number_style.currentIndex()
         self.auto_number_headings(number_style)
-        new_path = self.get_new_save_path()
-        if new_path:
-            self.doc.save(new_path)
-            QMessageBox.information(self, "完成", f"格式统一与自动编号完成，新文件保存为：{new_path}")
-            self.doc = Document(new_path)
-            self.scan_headings()
+        self.statusBar().showMessage("格式统一与自动编号完成，点击"生成新 Word 文件"保存")
 
     def auto_number_headings(self, number_style):
         if number_style == 0:
-            self.number_by_digit()
+            self.number_by_perfect_format()
         elif number_style == 1:
+            self.number_by_digit()
+        elif number_style == 2:
+            self.number_by_roman()
+        elif number_style == 3:
+            self.number_by_alpha()
+        elif number_style == 4:
             self.number_by_chinese()
 
-    def number_by_digit(self):
-        counters = [0, 0, 0]
+    def number_by_perfect_format(self):
+        """与完美格式标题一致"""
+        selected_items = self.list_headings.selectedItems()
+        if not selected_items:
+            return
+        source_idx = selected_items[0].data(Qt.UserRole)
+        source_para_idx, source_level, source_text = self.headings[source_idx]
+        detected = detect_number_format(source_text)
+        if not detected:
+            return
+        num_type, sep, has_space, num_part, rest = detected
+        
+        # 按层级分组，分别处理
+        counters = [0] * MAX_LEVEL
         for i, (para_idx, level, text) in enumerate(self.headings):
             counters[level-1] += 1
-            for j in range(level, 3):
+            for j in range(level, MAX_LEVEL):
                 counters[j] = 0
-            if level == 1:
-                new_num = str(counters[0])
-            elif level == 2:
-                new_num = f"{counters[0]}.{counters[1]}"
-            else:
-                new_num = f"{counters[0]}.{counters[1]}.{counters[2]}"
+            new_num = generate_number(num_type, level, counters, sep, has_space)
+            title_text = self.remove_old_number(text)
+            new_text = f"{new_num}{title_text}"
+            self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
+            self.headings[i] = (para_idx, level, new_text)
+
+    def number_by_digit(self):
+        counters = [0] * MAX_LEVEL
+        for i, (para_idx, level, text) in enumerate(self.headings):
+            counters[level-1] += 1
+            for j in range(level, MAX_LEVEL):
+                counters[j] = 0
+            new_num = '.'.join(str(counters[j]) for j in range(level))
+            new_text = f"{new_num} {self.remove_old_number(text)}"
+            self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
+            self.headings[i] = (para_idx, level, new_text)
+
+    def number_by_roman(self):
+        counters = [0] * MAX_LEVEL
+        for i, (para_idx, level, text) in enumerate(self.headings):
+            counters[level-1] += 1
+            for j in range(level, MAX_LEVEL):
+                counters[j] = 0
+            nums = [int_to_roman(counters[j]) for j in range(level)]
+            new_num = '.'.join(nums)
+            new_text = f"{new_num} {self.remove_old_number(text)}"
+            self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
+            self.headings[i] = (para_idx, level, new_text)
+
+    def number_by_alpha(self):
+        counters = [0] * MAX_LEVEL
+        for i, (para_idx, level, text) in enumerate(self.headings):
+            counters[level-1] += 1
+            for j in range(level, MAX_LEVEL):
+                counters[j] = 0
+            nums = [int_to_alpha(counters[j]) for j in range(level)]
+            new_num = '.'.join(nums)
             new_text = f"{new_num} {self.remove_old_number(text)}"
             self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
             self.headings[i] = (para_idx, level, new_text)
 
     def number_by_chinese(self):
-        l1 = l2 = l3 = 0
+        counters = [0] * MAX_LEVEL
         for i, (para_idx, level, text) in enumerate(self.headings):
+            counters[level-1] += 1
+            for j in range(level, MAX_LEVEL):
+                counters[j] = 0
             if level == 1:
-                l1 += 1
-                l2 = l3 = 0
-                new_num = self.to_chinese_number(l1) + "、"
+                new_num = to_chinese_number(counters[0]) + '、'
             elif level == 2:
-                l2 += 1
-                l3 = 0
-                new_num = "（" + self.to_chinese_number(l2) + "）"
+                new_num = '（' + to_chinese_number(counters[1]) + '）'
+            elif level == 3:
+                new_num = str(counters[2]) + '）'
+            elif level == 4:
+                circles = '①②③④⑤⑥⑦⑧⑨⑩'
+                new_num = circles[min(counters[3]-1, 9)]
             else:
-                l3 += 1
-                new_num = str(l3) + "）"
+                new_num = int_to_alpha(counters[4])
             new_text = f"{new_num}{self.remove_old_number(text)}"
             self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
             self.headings[i] = (para_idx, level, new_text)
 
-    def to_chinese_number(self, num):
-        digits = ['零','一','二','三','四','五','六','七','八','九']
-        if num <= 10:
-            return digits[num] if num < 10 else '十'
-        elif num < 20:
-            return '十' + digits[num%10] if num%10 else '十'
-        elif num < 100:
-            return digits[num//10] + '十' + (digits[num%10] if num%10 else '')
-        return str(num)
-
     def remove_old_number(self, text):
-        text = re.sub(r'^(\d+(\.\d+)*)\s+', '', text)
-        text = re.sub(r'^[一二三四五六七八九十百千]+、', '', text)
-        text = re.sub(r'^（[一二三四五六七八九十百千]+）', '', text)
-        text = re.sub(r'^\d+）', '', text)
-        text = re.sub(r'^[①-⑩]', '', text)
+        detected = detect_number_format(text)
+        if detected:
+            num_type, sep, has_space, num_part, rest = detected
+            return rest.strip()
         return text.strip()
 
     def set_paragraph_text(self, para, new_text):
@@ -875,10 +1132,7 @@ class MainWindow(QMainWindow):
         title_run.bold = True
         title_run.font.size = Pt(16)
         title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        new_path = self.get_new_save_path()
-        if new_path:
-            self.doc.save(new_path)
-            QMessageBox.information(self, "完成", f"目录已插入，新文件保存为：{new_path}\n请在 Word 中更新域显示页码")
+        self.statusBar().showMessage("目录已插入，点击"生成新 Word 文件"保存")
 
     # ================== 表格填充 ==================
     def list_tables(self):
@@ -925,12 +1179,9 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请指定列")
             return
         levels = []
-        if self.check_fill_l1.isChecked():
-            levels.append(1)
-        if self.check_fill_l2.isChecked():
-            levels.append(2)
-        if self.check_fill_l3.isChecked():
-            levels.append(3)
+        for i, check in enumerate(self.check_fill_levels):
+            if check.isChecked():
+                levels.append(i+1)
         titles = [(level, text) for _, level, text in self.headings if level in levels]
         if not titles:
             QMessageBox.warning(self, "警告", "没有符合层级的标题")
@@ -945,27 +1196,13 @@ class MainWindow(QMainWindow):
             row = table.rows[i+1]
             row.cells[seq_col].text = self.extract_seq_text(text, i+1)
             row.cells[title_col].text = text
-        new_path = self.get_new_save_path()
-        if new_path:
-            self.doc.save(new_path)
-            QMessageBox.information(self, "完成", f"表格填充完成，新文件保存为：{new_path}")
+        self.statusBar().showMessage("表格填充完成，点击"生成新 Word 文件"保存")
 
     def extract_seq_text(self, text, fallback):
-        match = re.match(r'^(\d+(\.\d+)*)\s+', text)
-        if match:
-            return match.group(1)
-        match = re.match(r'^([一二三四五六七八九十百千]+、)', text)
-        if match:
-            return match.group(1)
-        match = re.match(r'^(（[一二三四五六七八九十百千]+）)', text)
-        if match:
-            return match.group(1)
-        match = re.match(r'^(\d+）)', text)
-        if match:
-            return match.group(1)
-        match = re.match(r'^([①-⑩])', text)
-        if match:
-            return match.group(1)
+        detected = detect_number_format(text)
+        if detected:
+            num_type, sep, has_space, num_part, rest = detected
+            return num_part
         return str(fallback)
 
     # ================== Excel 导入导出 ==================
@@ -1064,10 +1301,7 @@ class MainWindow(QMainWindow):
         for i, row_data in enumerate(data_rows):
             value = row_data[excel_col]
             table.rows[i+1].cells[word_col].text = str(value) if value is not None else ""
-        new_path = self.get_new_save_path()
-        if new_path:
-            self.doc.save(new_path)
-            QMessageBox.information(self, "完成", f"导入完成，新文件保存为：{new_path}")
+        self.statusBar().showMessage("导入完成，点击"生成新 Word 文件"保存")
 
     def update_import_cols(self, combo_table, combo_word_col):
         combo_word_col.clear()
