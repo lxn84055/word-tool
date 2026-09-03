@@ -1,60 +1,83 @@
 import sys
 import re
 import os
+import tempfile
+import shutil
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from openpyxl import Workbook, load_workbook
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QListWidget, QListWidgetItem, QLabel,
-    QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
-    QTabWidget, QLineEdit, QMessageBox, QTextEdit, QDialog, QDialogButtonBox,
-    QGroupBox, QFormLayout, QMenu, QAction, QColorDialog, QFontComboBox
+    QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QTabWidget,
+    QMessageBox, QDialog, QDialogButtonBox, QGroupBox, QFormLayout,
+    QMenu, QColorDialog, QFontComboBox
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
+# ================== Word COM 检测与转换 ==================
+
+def check_word_available():
+    """检测系统中是否安装了 Microsoft Word"""
+    try:
+        import win32com.client
+        word = win32com.client.Dispatch("Word.Application")
+        word.Quit()
+        return True
+    except:
+        return False
+
+def convert_doc_to_docx(doc_path):
+    """使用 Word COM 将 .doc 转换为 .docx，返回转换后的路径"""
+    try:
+        import win32com.client
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        doc = word.Documents.Open(doc_path)
+        # 创建临时文件
+        temp_dir = tempfile.gettempdir()
+        base_name = os.path.splitext(os.path.basename(doc_path))[0]
+        docx_path = os.path.join(temp_dir, f"{base_name}_converted.docx")
+        # 另存为 docx（16 = docx 格式）
+        doc.SaveAs2(docx_path, FileFormat=16)
+        doc.Close()
+        word.Quit()
+        return docx_path
+    except Exception as e:
+        return None
+
 # ================== 辅助函数 ==================
 
 def is_heading_paragraph(para):
-    """判断段落是否为标题，返回 (是否, 层级)"""
+    """判断段落是否为标题"""
     text = para.text.strip()
     if not text:
         return False, 0
-
-    # 数字编号：1, 1.1, 1.1.1
     if re.match(r'^(\d+(\.\d+)*)\s+', text):
         parts = text.split()[0].split('.')
         level = min(len(parts), 3)
         return True, level
-
-    # 中文序号一级：一、 二、
     if re.match(r'^[一二三四五六七八九十百千]+、', text):
         return True, 1
-    # 中文序号二级：（一）
     if re.match(r'^（[一二三四五六七八九十百千]+）', text):
         return True, 2
-    # 数字括号二级：1）
     if re.match(r'^\d+）', text):
         return True, 2
-    # 圈号三级：①
     if re.match(r'^[①-⑩]', text):
         return True, 3
-
     return False, 0
 
 def set_heading_style(paragraph, level):
-    """设置为内置标题样式"""
     try:
         paragraph.style = paragraph.part.document.styles[f'Heading {level}']
     except:
         pass
 
 def add_toc(paragraph, levels=3):
-    """插入目录域"""
     run = paragraph.add_run()
     fldChar = OxmlElement('w:fldChar')
     fldChar.set(qn('w:fldCharType'), 'begin')
@@ -77,33 +100,22 @@ def get_table_name(table, doc, index):
     return f"表格 {index+1}"
 
 def is_empty_paragraph(para):
-    """判断是否为空段落（无文本或只有空白）"""
     return not para.text.strip()
 
 def count_empty_paragraphs_before(doc, para_index):
-    """计算段落前的连续空段落数"""
     count = 0
     idx = para_index - 1
-    while idx >= 0:
-        para = doc.paragraphs[idx]
-        if is_empty_paragraph(para):
-            count += 1
-            idx -= 1
-        else:
-            break
+    while idx >= 0 and is_empty_paragraph(doc.paragraphs[idx]):
+        count += 1
+        idx -= 1
     return count
 
 def count_empty_paragraphs_after(doc, para_index):
-    """计算段落后的连续空段落数"""
     count = 0
     idx = para_index + 1
-    while idx < len(doc.paragraphs):
-        para = doc.paragraphs[idx]
-        if is_empty_paragraph(para):
-            count += 1
-            idx += 1
-        else:
-            break
+    while idx < len(doc.paragraphs) and is_empty_paragraph(doc.paragraphs[idx]):
+        count += 1
+        idx += 1
     return count
 
 # ================== 主窗口 ==================
@@ -113,11 +125,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Word 智能标题与表格处理工具")
         self.setGeometry(100, 100, 1200, 900)
-
         self.current_doc_path = None
         self.doc = None
-        self.headings = []  # 存储 (paragraph_index, level, text)
-
+        self.headings = []
+        self.converted_temp_path = None  # 记录转换后的临时文件路径
         self.init_ui()
 
     def init_ui(self):
@@ -125,7 +136,6 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # 文件选择
         file_layout = QHBoxLayout()
         self.btn_open = QPushButton("打开 Word 文档")
         self.btn_open.clicked.connect(self.open_document)
@@ -134,7 +144,6 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.lbl_file, 1)
         main_layout.addLayout(file_layout)
 
-        # 选项卡
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
@@ -155,12 +164,10 @@ class MainWindow(QMainWindow):
     def init_tab1(self):
         layout = QVBoxLayout(self.tab1)
 
-        # 扫描按钮
         self.btn_scan = QPushButton("扫描标题")
         self.btn_scan.clicked.connect(self.scan_headings)
         layout.addWidget(self.btn_scan)
 
-        # 标题列表（带右键菜单）
         self.list_headings = QListWidget()
         self.list_headings.setSelectionMode(QListWidget.MultiSelection)
         self.list_headings.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -168,7 +175,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("识别到的标题（右键可管理）："))
         layout.addWidget(self.list_headings)
 
-        # 按钮行
         btn_row = QHBoxLayout()
         self.btn_add_heading = QPushButton("从段落中选取添加标题")
         self.btn_add_heading.clicked.connect(self.show_paragraph_picker)
@@ -181,7 +187,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_mark_non_heading)
         layout.addLayout(btn_row)
 
-        # 调整层级
         level_row = QHBoxLayout()
         level_row.addWidget(QLabel("调整选中标题层级为："))
         self.combo_set_level = QComboBox()
@@ -192,16 +197,13 @@ class MainWindow(QMainWindow):
         level_row.addWidget(self.btn_set_level)
         layout.addLayout(level_row)
 
-        # 应用样式
         self.btn_apply_style = QPushButton("将选中标题应用为 Word 标题样式")
         self.btn_apply_style.clicked.connect(self.apply_heading_styles)
         layout.addWidget(self.btn_apply_style)
 
-        # 格式统一区域
         group_format = QGroupBox("标题格式统一与自动编号")
         format_layout = QVBoxLayout()
 
-        # 作用层级
         level_select_row = QHBoxLayout()
         level_select_row.addWidget(QLabel("作用层级："))
         self.check_unify_level1 = QCheckBox("一级")
@@ -215,7 +217,6 @@ class MainWindow(QMainWindow):
         level_select_row.addWidget(self.check_unify_level3)
         format_layout.addLayout(level_select_row)
 
-        # 编号样式
         num_row = QHBoxLayout()
         num_row.addWidget(QLabel("编号样式："))
         self.combo_number_style = QComboBox()
@@ -223,7 +224,6 @@ class MainWindow(QMainWindow):
         num_row.addWidget(self.combo_number_style)
         format_layout.addLayout(num_row)
 
-        # 格式来源
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("格式来源："))
         self.radio_format_source = QComboBox()
@@ -231,7 +231,6 @@ class MainWindow(QMainWindow):
         source_row.addWidget(self.radio_format_source)
         format_layout.addLayout(source_row)
 
-        # 手动设置控件
         self.manual_widget = QWidget()
         manual_layout = QVBoxLayout()
         row1 = QHBoxLayout()
@@ -270,24 +269,21 @@ class MainWindow(QMainWindow):
         row4.addWidget(QLabel("段前(磅)："))
         self.spin_space_before = QDoubleSpinBox()
         self.spin_space_before.setRange(0, 100)
-        self.spin_space_before.setValue(0)
         row4.addWidget(self.spin_space_before)
         row4.addWidget(QLabel("段后(磅)："))
         self.spin_space_after = QDoubleSpinBox()
         self.spin_space_after.setRange(0, 100)
-        self.spin_space_after.setValue(0)
         row4.addWidget(self.spin_space_after)
         manual_layout.addLayout(row4)
 
         row5 = QHBoxLayout()
         row5.addWidget(QLabel("行距："))
         self.combo_line_spacing = QComboBox()
-        self.combo_line_spacing.addItems(["单倍行距", "1.5倍行距", "2倍行距", "固定值"])
+        self.combo_line_spacing.addItems(["单倍行距", "1.5倍行距", "2倍行距"])
         row5.addWidget(self.combo_line_spacing)
         row5.addWidget(QLabel("首行缩进(磅)："))
         self.spin_first_indent = QDoubleSpinBox()
         self.spin_first_indent.setRange(0, 100)
-        self.spin_first_indent.setValue(0)
         row5.addWidget(self.spin_first_indent)
         manual_layout.addLayout(row5)
 
@@ -295,17 +291,14 @@ class MainWindow(QMainWindow):
         row6.addWidget(QLabel("左缩进(磅)："))
         self.spin_left_indent = QDoubleSpinBox()
         self.spin_left_indent.setRange(0, 100)
-        self.spin_left_indent.setValue(0)
         row6.addWidget(self.spin_left_indent)
         row6.addWidget(QLabel("前空行数："))
         self.spin_empty_before = QSpinBox()
         self.spin_empty_before.setRange(0, 10)
-        self.spin_empty_before.setValue(0)
         row6.addWidget(self.spin_empty_before)
         row6.addWidget(QLabel("后空行数："))
         self.spin_empty_after = QSpinBox()
         self.spin_empty_after.setRange(0, 10)
-        self.spin_empty_after.setValue(0)
         row6.addWidget(self.spin_empty_after)
         manual_layout.addLayout(row6)
 
@@ -317,7 +310,6 @@ class MainWindow(QMainWindow):
             lambda idx: self.manual_widget.setVisible(idx == 1)
         )
 
-        # 执行按钮
         self.btn_unify = QPushButton("统一格式并自动编号")
         self.btn_unify.clicked.connect(self.unify_format_and_number)
         format_layout.addWidget(self.btn_unify)
@@ -325,7 +317,6 @@ class MainWindow(QMainWindow):
         group_format.setLayout(format_layout)
         layout.addWidget(group_format)
 
-        # 目录设置
         group_dir = QGroupBox("生成目录")
         dir_layout = QFormLayout()
         self.spin_toc_levels = QSpinBox()
@@ -343,19 +334,16 @@ class MainWindow(QMainWindow):
         self.btn_list_tables = QPushButton("列出所有表格")
         self.btn_list_tables.clicked.connect(self.list_tables)
         layout.addWidget(self.btn_list_tables)
-
         self.combo_tables = QComboBox()
         self.combo_tables.currentIndexChanged.connect(self.on_table_selected)
         layout.addWidget(QLabel("选择要填充的表格："))
         layout.addWidget(self.combo_tables)
-
         self.combo_seq_col = QComboBox()
         self.combo_title_col = QComboBox()
         layout.addWidget(QLabel("序号列："))
         layout.addWidget(self.combo_seq_col)
         layout.addWidget(QLabel("标题列："))
         layout.addWidget(self.combo_title_col)
-
         level_row = QHBoxLayout()
         self.check_fill_l1 = QCheckBox("一级")
         self.check_fill_l1.setChecked(True)
@@ -368,7 +356,6 @@ class MainWindow(QMainWindow):
         level_row.addWidget(self.check_fill_l2)
         level_row.addWidget(self.check_fill_l3)
         layout.addLayout(level_row)
-
         self.btn_fill_table = QPushButton("填充表格")
         self.btn_fill_table.clicked.connect(self.fill_table)
         layout.addWidget(self.btn_fill_table)
@@ -393,16 +380,44 @@ class MainWindow(QMainWindow):
 
     # ================== 文件操作 ==================
     def open_document(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择 Word 文档", "", "Word 文档 (*.docx)")
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择 Word 文档", "", "Word 文档 (*.docx *.doc)"
+        )
         if not file_path:
             return
-        self.current_doc_path = file_path
-        self.lbl_file.setText(file_path)
-        self.doc = Document(file_path)
+
+        # 检查文件类型
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == '.doc':
+            # 尝试用 Word 转换
+            if check_word_available():
+                QMessageBox.information(self, "提示", "检测到 .doc 文件，正在使用 Word 转换...")
+                docx_path = convert_doc_to_docx(file_path)
+                if docx_path and os.path.exists(docx_path):
+                    self.converted_temp_path = docx_path
+                    self.current_doc_path = file_path  # 保留原始路径用于保存
+                    self.doc = Document(docx_path)
+                    self.lbl_file.setText(f"{file_path} (已自动转换为 .docx)")
+                    self.statusBar().showMessage("已加载（通过 Word 转换）")
+                else:
+                    QMessageBox.warning(self, "警告", "转换失败，请手动用 WPS 另存为 .docx 后重新打开")
+                    return
+            else:
+                QMessageBox.warning(
+                    self, "提示",
+                    "未检测到 Microsoft Word。\n\n请用 WPS 打开该 .doc 文件，"
+                    "然后另存为 .docx 格式，再重新打开 .docx 文件。"
+                )
+                return
+        else:
+            self.current_doc_path = file_path
+            self.doc = Document(file_path)
+            self.lbl_file.setText(file_path)
+            self.statusBar().showMessage(f"已打开：{file_path}")
+
         self.headings = []
         self.list_headings.clear()
         self.combo_tables.clear()
-        self.statusBar().showMessage(f"已打开：{file_path}")
 
     def get_new_save_path(self):
         if not self.current_doc_path:
@@ -467,8 +482,7 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("选择要标记为标题的段落")
         dialog.setGeometry(200, 200, 600, 500)
         layout = QVBoxLayout(dialog)
-        label = QLabel("勾选要标记为标题的段落（已识别的标题置灰）：")
-        layout.addWidget(label)
+        layout.addWidget(QLabel("勾选要标记为标题的段落（已识别的标题置灰）："))
         list_widget = QListWidget()
         list_widget.setSelectionMode(QListWidget.MultiSelection)
         heading_indices = set(h[0] for h in self.headings)
@@ -478,7 +492,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem(f"{i+1}: {para.text.strip()[:60]}")
             item.setData(Qt.UserRole, i)
             if i in heading_indices:
-                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)  # 置灰
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             list_widget.addItem(item)
         layout.addWidget(list_widget)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -490,7 +504,6 @@ class MainWindow(QMainWindow):
         selected = [item.data(Qt.UserRole) for item in list_widget.selectedItems()]
         if not selected:
             return
-        # 弹窗选择层级
         level_dialog = QDialog(self)
         level_dialog.setWindowTitle("选择标题层级")
         level_layout = QFormLayout(level_dialog)
@@ -517,7 +530,6 @@ class MainWindow(QMainWindow):
         if not selected_items:
             QMessageBox.warning(self, "警告", "请先选择要删除的标题")
             return
-        # 询问是否修改文档格式
         reply = QMessageBox.question(self, "确认", "是否同时清除文档中这些段落的标题格式？",
                                      QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
         if reply == QMessageBox.Cancel:
@@ -529,13 +541,10 @@ class MainWindow(QMainWindow):
             indices_to_remove.append(idx)
             if clear_format:
                 para_idx = self.headings[idx][0]
-                para = self.doc.paragraphs[para_idx]
-                para.style = self.doc.styles['Normal']
-        # 从列表移除
+                self.doc.paragraphs[para_idx].style = self.doc.styles['Normal']
         indices_to_remove.sort(reverse=True)
         for idx in indices_to_remove:
             self.headings.pop(idx)
-        # 刷新列表
         self.refresh_heading_list()
 
     def mark_selected_as_non_heading(self):
@@ -554,8 +563,7 @@ class MainWindow(QMainWindow):
             indices_to_remove.append(idx)
             if clear_format:
                 para_idx = self.headings[idx][0]
-                para = self.doc.paragraphs[para_idx]
-                para.style = self.doc.styles['Normal']
+                self.doc.paragraphs[para_idx].style = self.doc.styles['Normal']
         indices_to_remove.sort(reverse=True)
         for idx in indices_to_remove:
             self.headings.pop(idx)
@@ -591,12 +599,11 @@ class MainWindow(QMainWindow):
         for item in selected_items:
             idx = item.data(Qt.UserRole)
             para_idx, level, _ = self.headings[idx]
-            para = self.doc.paragraphs[para_idx]
-            set_heading_style(para, level)
+            set_heading_style(self.doc.paragraphs[para_idx], level)
         new_path = self.get_new_save_path()
         if new_path:
             self.doc.save(new_path)
-            QMessageBox.information(self, "完成", f"已应用标题样式，新文件保存为：{new_path}")
+            QMessageBox.information(self, "完成", f"新文件保存为：{new_path}")
 
     # ================== 格式统一与自动编号 ==================
     def pick_color(self):
@@ -617,7 +624,6 @@ class MainWindow(QMainWindow):
         return levels
 
     def get_paragraph_full_format(self, para, para_index):
-        """获取段落完整格式，包括前后空行数"""
         format_info = {}
         if para.runs:
             run = para.runs[0]
@@ -647,16 +653,11 @@ class MainWindow(QMainWindow):
         format_info['keep_together'] = pf.keep_together
         format_info['page_break_before'] = pf.page_break_before
         format_info['widow_control'] = pf.widow_control
-
-        # 前后空行数
         format_info['empty_before'] = count_empty_paragraphs_before(self.doc, para_index)
         format_info['empty_after'] = count_empty_paragraphs_after(self.doc, para_index)
-
         return format_info
 
     def apply_paragraph_full_format(self, para, para_index, format_info):
-        """应用完整格式（包括前后空行处理）"""
-        # 应用字体格式
         for run in para.runs:
             if format_info.get('font_name'):
                 run.font.name = format_info['font_name']
@@ -675,7 +676,6 @@ class MainWindow(QMainWindow):
             if format_info.get('color'):
                 run.font.color.rgb = format_info['color']
 
-        # 应用段落格式
         pf = para.paragraph_format
         if format_info.get('alignment') is not None:
             pf.alignment = format_info['alignment']
@@ -698,29 +698,23 @@ class MainWindow(QMainWindow):
         if format_info.get('widow_control') is not None:
             pf.widow_control = format_info['widow_control']
 
-        # 处理前后空行
         target_before = format_info.get('empty_before', 0)
         target_after = format_info.get('empty_after', 0)
         self.adjust_empty_paragraphs(para_index, target_before, target_after)
 
     def adjust_empty_paragraphs(self, para_index, target_before, target_after):
-        """调整标题前后的空段落数"""
-        # 处理前方空行
         current_before = count_empty_paragraphs_before(self.doc, para_index)
         if current_before > target_before:
-            # 删除多余空行
             for _ in range(current_before - target_before):
                 idx = para_index - 1
                 if idx >= 0 and is_empty_paragraph(self.doc.paragraphs[idx]):
                     self.doc.paragraphs[idx]._element.getparent().remove(self.doc.paragraphs[idx]._element)
                     para_index -= 1
         elif current_before < target_before:
-            # 插入空行
             for _ in range(target_before - current_before):
                 new_para = self.doc.paragraphs[para_index].insert_paragraph_before()
                 new_para.style = self.doc.styles['Normal']
 
-        # 处理后方空行（需重新定位段落索引）
         current_after = count_empty_paragraphs_after(self.doc, para_index)
         if current_after > target_after:
             for _ in range(current_after - target_after):
@@ -731,63 +725,51 @@ class MainWindow(QMainWindow):
             for _ in range(target_after - current_after):
                 new_para = self.doc.paragraphs[para_index].insert_paragraph_before()
                 new_para.style = self.doc.styles['Normal']
-                # 移动到标题后面
                 new_para._element.addnext(self.doc.paragraphs[para_index]._element)
 
     def apply_manual_format_to_para(self, para, para_index):
-        """手动格式应用（只修改用户填写的项目）"""
-        # 字体设置
-        if self.check_bold.isChecked() or self.check_italic.isChecked() or self.check_color.isChecked() or True:
-            font_name = self.combo_font.currentFont().family()
-            font_size = float(self.combo_font_size.currentText())
-            for run in para.runs:
-                run.font.name = font_name
-                if run._element.rPr is not None:
-                    rFonts = run._element.rPr.find(qn('w:rFonts'))
-                    if rFonts is None:
-                        rFonts = OxmlElement('w:rFonts')
-                        run._element.rPr.append(rFonts)
-                    rFonts.set(qn('w:eastAsia'), font_name)
-                run.font.size = Pt(font_size)
-                if self.check_bold.isChecked():
-                    run.font.bold = True
-                if self.check_italic.isChecked():
-                    run.font.italic = True
-                if self.check_color.isChecked() and self.color_value:
-                    run.font.color.rgb = RGBColor(self.color_value.red(), self.color_value.green(), self.color_value.blue())
+        font_name = self.combo_font.currentFont().family()
+        font_size = float(self.combo_font_size.currentText())
+        for run in para.runs:
+            run.font.name = font_name
+            if run._element.rPr is not None:
+                rFonts = run._element.rPr.find(qn('w:rFonts'))
+                if rFonts is None:
+                    rFonts = OxmlElement('w:rFonts')
+                    run._element.rPr.append(rFonts)
+                rFonts.set(qn('w:eastAsia'), font_name)
+            run.font.size = Pt(font_size)
+            if self.check_bold.isChecked():
+                run.font.bold = True
+            if self.check_italic.isChecked():
+                run.font.italic = True
+            if self.check_color.isChecked() and self.color_value:
+                run.font.color.rgb = RGBColor(self.color_value.red(), self.color_value.green(), self.color_value.blue())
 
         pf = para.paragraph_format
-        # 对齐
         align_map = {"左对齐": WD_ALIGN_PARAGRAPH.LEFT, "居中": WD_ALIGN_PARAGRAPH.CENTER,
                      "右对齐": WD_ALIGN_PARAGRAPH.RIGHT, "两端对齐": WD_ALIGN_PARAGRAPH.JUSTIFY}
         pf.alignment = align_map.get(self.combo_alignment.currentText(), WD_ALIGN_PARAGRAPH.LEFT)
-        # 间距
         pf.space_before = Pt(self.spin_space_before.value())
         pf.space_after = Pt(self.spin_space_after.value())
-        # 行距
         ls_map = {"单倍行距": 1.0, "1.5倍行距": 1.5, "2倍行距": 2.0}
         ls_text = self.combo_line_spacing.currentText()
         if ls_text in ls_map:
             pf.line_spacing = ls_map[ls_text]
-        # 缩进
         pf.first_line_indent = Pt(self.spin_first_indent.value())
         pf.left_indent = Pt(self.spin_left_indent.value())
-        # 前后空行
         self.adjust_empty_paragraphs(para_index, self.spin_empty_before.value(), self.spin_empty_after.value())
 
     def unify_format_and_number(self):
         if not self.doc or not self.headings:
             QMessageBox.warning(self, "警告", "请先打开文档并扫描标题")
             return
-
         levels_to_unify = self.get_selected_levels()
         if not levels_to_unify:
             QMessageBox.warning(self, "警告", "请选择至少一个层级")
             return
-
         format_source = self.radio_format_source.currentIndex()
-
-        if format_source == 0:  # 从选定标题复制
+        if format_source == 0:
             selected_items = self.list_headings.selectedItems()
             if len(selected_items) != 1:
                 QMessageBox.warning(self, "警告", "请选择一个“完美格式”标题")
@@ -796,27 +778,20 @@ class MainWindow(QMainWindow):
             source_para_idx, source_level, _ = self.headings[source_idx]
             source_para = self.doc.paragraphs[source_para_idx]
             source_format = self.get_paragraph_full_format(source_para, source_para_idx)
-            # 应用到同层级的其他标题
             for i, (para_idx, level, text) in enumerate(self.headings):
                 if level in levels_to_unify:
-                    para = self.doc.paragraphs[para_idx]
-                    self.apply_paragraph_full_format(para, para_idx, source_format)
-        else:  # 手动设置
+                    self.apply_paragraph_full_format(self.doc.paragraphs[para_idx], para_idx, source_format)
+        else:
             for i, (para_idx, level, text) in enumerate(self.headings):
                 if level in levels_to_unify:
-                    para = self.doc.paragraphs[para_idx]
-                    self.apply_manual_format_to_para(para, para_idx)
+                    self.apply_manual_format_to_para(self.doc.paragraphs[para_idx], para_idx)
 
-        # 自动编号
         number_style = self.combo_number_style.currentIndex()
         self.auto_number_headings(number_style)
-
-        # 保存
         new_path = self.get_new_save_path()
         if new_path:
             self.doc.save(new_path)
             QMessageBox.information(self, "完成", f"格式统一与自动编号完成，新文件保存为：{new_path}")
-            # 重新加载文档以更新索引
             self.doc = Document(new_path)
             self.scan_headings()
 
@@ -839,8 +814,7 @@ class MainWindow(QMainWindow):
             else:
                 new_num = f"{counters[0]}.{counters[1]}.{counters[2]}"
             new_text = f"{new_num} {self.remove_old_number(text)}"
-            para = self.doc.paragraphs[para_idx]
-            self.set_paragraph_text(para, new_text)
+            self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
             self.headings[i] = (para_idx, level, new_text)
 
     def number_by_chinese(self):
@@ -858,8 +832,7 @@ class MainWindow(QMainWindow):
                 l3 += 1
                 new_num = str(l3) + "）"
             new_text = f"{new_num}{self.remove_old_number(text)}"
-            para = self.doc.paragraphs[para_idx]
-            self.set_paragraph_text(para, new_text)
+            self.set_paragraph_text(self.doc.paragraphs[para_idx], new_text)
             self.headings[i] = (para_idx, level, new_text)
 
     def to_chinese_number(self, num):
