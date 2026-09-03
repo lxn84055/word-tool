@@ -50,11 +50,7 @@ def convert_doc_to_docx(doc_path):
 MAX_LEVEL = 5
 
 def detect_number_format(text):
-    """
-    检测标题文本中的编号格式
-    返回 (编号类型, 分隔符, 是否有空格, 编号部分, 标题文字)
-    编号类型: 'digit', 'roman', 'alpha', 'chinese', 'chinese_paren', 'paren_digit', 'circle'
-    """
+    """检测标题文本中的编号格式"""
     text = text.strip()
     
     # 中文序号：一、
@@ -77,7 +73,7 @@ def detect_number_format(text):
     if match:
         return ('circle', '', False, match.group(1), match.group(2))
     
-    # 数字编号：1 测试、1. 测试、1、测试、1.1 测试、1.1. 测试
+    # 数字编号
     match = re.match(r'^(\d+(?:\.\d+)*)([、.]?)\s*(.*)', text)
     if match:
         num_part = match.group(1)
@@ -86,7 +82,7 @@ def detect_number_format(text):
         if rest or sep:
             return ('digit', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
     
-    # 罗马数字编号：I. 测试、I 测试、I.I 测试
+    # 罗马数字编号
     match = re.match(r'^([IVXLCivxlc]+(?:[.、](?:[IVXLCivxlc]+|\d+))*)([、.]?)\s*(.*)', text)
     if match:
         num_part = match.group(1)
@@ -95,7 +91,7 @@ def detect_number_format(text):
         if rest or sep:
             return ('roman', sep, bool(sep and rest and rest[0] != ' '), num_part, rest)
     
-    # 英文字母编号：A. 测试、A 测试、A.a 测试
+    # 英文字母编号
     match = re.match(r'^([A-Za-z](?:[.、](?:[A-Za-z]|\d+))*)([、.]?)\s*(.*)', text)
     if match:
         num_part = match.group(1)
@@ -111,12 +107,10 @@ def get_heading_level_from_style(para):
     try:
         style_name = para.style.name.lower()
         if 'heading' in style_name:
-            # 提取数字
             match = re.search(r'heading\s*(\d+)', style_name)
             if match:
                 level = int(match.group(1))
                 return min(level, MAX_LEVEL)
-        # 中文样式名
         if '标题' in style_name:
             match = re.search(r'标题\s*(\d+)', style_name)
             if match:
@@ -127,7 +121,7 @@ def get_heading_level_from_style(para):
     return None
 
 def is_heading_paragraph(para):
-    """判断段落是否为标题，返回 (是否, 层级)"""
+    """判断段落是否为标题"""
     text = para.text.strip()
     if not text:
         return False, 0
@@ -141,17 +135,13 @@ def is_heading_paragraph(para):
     detected = detect_number_format(text)
     if detected:
         num_type, sep, has_space, num_part, rest = detected
-        # 计算标题文字长度
         title_text = rest.strip()
-        # 中文标题长度检查：不超过30字
         chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
-        # 英文标题长度检查：不超过20个单词
         english_words = len(re.findall(r'[A-Za-z]+', title_text))
         
         if chinese_chars > 30 or english_words > 20:
             return False, 0
         
-        # 计算层级
         if num_type == 'digit':
             level = len(num_part.split('.'))
         elif num_type == 'roman':
@@ -173,19 +163,6 @@ def is_heading_paragraph(para):
         return True, level
     
     return False, 0
-
-def roman_to_int(roman):
-    roman_values = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100}
-    result = 0
-    prev = 0
-    for char in reversed(roman.upper()):
-        value = roman_values.get(char, 0)
-        if value < prev:
-            result -= value
-        else:
-            result += value
-        prev = value
-    return result
 
 def int_to_roman(num):
     values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
@@ -270,7 +247,7 @@ def add_toc(paragraph, levels=5):
     fldChar2 = OxmlElement('w:fldChar')
     fldChar2.set(qn('w:fldCharType'), 'separate')
     t = OxmlElement('w:t')
-    t.text = "目录：请在此处右键选择“更新域”以生成目录内容。"
+    t.text = "目录：请在此处右键选择更新域以生成目录内容。"
     fldChar3 = OxmlElement('w:fldChar')
     fldChar3.set(qn('w:fldCharType'), 'end')
     run._r.append(fldChar)
@@ -520,7 +497,6 @@ class MainWindow(QMainWindow):
         group_dir.setLayout(dir_layout)
         layout.addWidget(group_dir)
 
-        # 生成新文件按钮
         self.btn_generate = QPushButton("生成新 Word 文件")
         self.btn_generate.clicked.connect(self.generate_new_document)
         self.btn_generate.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-size: 14px; padding: 8px; }")
@@ -627,7 +603,6 @@ class MainWindow(QMainWindow):
         return new_path
 
     def generate_new_document(self):
-        """生成新 Word 文件（最终确认后）"""
         if not self.doc:
             QMessageBox.warning(self, "警告", "请先打开 Word 文档")
             return
@@ -827,7 +802,7 @@ class MainWindow(QMainWindow):
             idx = item.data(Qt.UserRole)
             para_idx, level, _ = self.headings[idx]
             set_heading_style(self.doc.paragraphs[para_idx], level)
-        self.statusBar().showMessage("已应用标题样式（点击"生成新 Word 文件"保存）")
+        self.statusBar().showMessage("已应用标题样式，点击生成新 Word 文件保存")
 
     # ================== 格式统一与自动编号 ==================
     def pick_color(self):
@@ -993,7 +968,7 @@ class MainWindow(QMainWindow):
         if format_source == 0:
             selected_items = self.list_headings.selectedItems()
             if len(selected_items) != 1:
-                QMessageBox.warning(self, "警告", "请选择一个"完美格式"标题")
+                QMessageBox.warning(self, "警告", "请选择一个完美格式标题")
                 return
             source_idx = selected_items[0].data(Qt.UserRole)
             source_para_idx, source_level, _ = self.headings[source_idx]
@@ -1009,7 +984,7 @@ class MainWindow(QMainWindow):
 
         number_style = self.combo_number_style.currentIndex()
         self.auto_number_headings(number_style)
-        self.statusBar().showMessage("格式统一与自动编号完成，点击"生成新 Word 文件"保存")
+        self.statusBar().showMessage("格式统一与自动编号完成，点击生成新 Word 文件保存")
 
     def auto_number_headings(self, number_style):
         if number_style == 0:
@@ -1024,7 +999,6 @@ class MainWindow(QMainWindow):
             self.number_by_chinese()
 
     def number_by_perfect_format(self):
-        """与完美格式标题一致"""
         selected_items = self.list_headings.selectedItems()
         if not selected_items:
             return
@@ -1035,7 +1009,6 @@ class MainWindow(QMainWindow):
             return
         num_type, sep, has_space, num_part, rest = detected
         
-        # 按层级分组，分别处理
         counters = [0] * MAX_LEVEL
         for i, (para_idx, level, text) in enumerate(self.headings):
             counters[level-1] += 1
@@ -1132,7 +1105,7 @@ class MainWindow(QMainWindow):
         title_run.bold = True
         title_run.font.size = Pt(16)
         title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        self.statusBar().showMessage("目录已插入，点击"生成新 Word 文件"保存")
+        self.statusBar().showMessage("目录已插入，点击生成新 Word 文件保存")
 
     # ================== 表格填充 ==================
     def list_tables(self):
@@ -1196,7 +1169,7 @@ class MainWindow(QMainWindow):
             row = table.rows[i+1]
             row.cells[seq_col].text = self.extract_seq_text(text, i+1)
             row.cells[title_col].text = text
-        self.statusBar().showMessage("表格填充完成，点击"生成新 Word 文件"保存")
+        self.statusBar().showMessage("表格填充完成，点击生成新 Word 文件保存")
 
     def extract_seq_text(self, text, fallback):
         detected = detect_number_format(text)
@@ -1301,7 +1274,7 @@ class MainWindow(QMainWindow):
         for i, row_data in enumerate(data_rows):
             value = row_data[excel_col]
             table.rows[i+1].cells[word_col].text = str(value) if value is not None else ""
-        self.statusBar().showMessage("导入完成，点击"生成新 Word 文件"保存")
+        self.statusBar().showMessage("导入完成，点击生成新 Word 文件保存")
 
     def update_import_cols(self, combo_table, combo_word_col):
         combo_word_col.clear()
