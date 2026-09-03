@@ -1,4 +1,27 @@
 import sys
+import sys
+import traceback
+import os
+
+# 错误捕获
+def show_error(exc_type, exc_value, exc_tb):
+    error_msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    # 保存到桌面错误日志
+    desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+    with open(os.path.join(desktop, 'error_log.txt'), 'w', encoding='utf-8') as f:
+        f.write(error_msg)
+    # 弹窗显示错误
+    try:
+        from PyQt5.QtWidgets import QMessageBox, QApplication
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+        QMessageBox.critical(None, "程序错误", error_msg[:500])
+    except:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = show_error
 import re
 import os
 import tempfile
