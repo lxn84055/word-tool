@@ -60,12 +60,13 @@ def clean_title_text(text):
 
 def detect_number_format(text):
     text = text.strip()
-    # 1. 中文序号
+
+    # 中文序号
     m = re.match(r'^([一二三四五六七八九十百千]+)([、.．]?)\s{0,4}(.*)', text)
     if m and (m.group(2) or m.group(3)):
         return ('chinese', m.group(2) or '、', False, m.group(1), m.group(3))
 
-    # 2. 括号类型
+    # 括号类型
     m = re.match(r'^[（(]([一二三四五六七八九十百千]+|\d+|[A-Za-z]+|[IVXLCivxlc]+)[）)]\s{0,4}(.*)', text)
     if m:
         inner = m.group(1)
@@ -79,7 +80,7 @@ def detect_number_format(text):
         elif re.match(r'^[IVXLCivxlc]+$', inner):
             return ('roman_paren', '', False, inner, rest)
 
-    # 3. 右括号结尾
+    # 右括号结尾
     m = re.match(r'^(\d+|[A-Za-z]+|[IVXLCivxlc]+)([)）])\s{0,4}(.*)', text)
     if m:
         num = m.group(1)
@@ -92,22 +93,22 @@ def detect_number_format(text):
         elif re.match(r'^[IVXLCivxlc]+$', num):
             return ('roman_paren', sep, False, num, rest)
 
-    # 4. 圈号
+    # 圈号
     m = re.match(r'^([①-⑩])\s{0,4}(.*)', text)
     if m:
         return ('circle', '', False, m.group(1), m.group(2))
 
-    # 5. 数字编号
+    # 数字编号
     m = re.match(r'^(\d+(?:[.．]\d+)*)([、.．]?)\s{0,4}(.*)', text)
     if m:
         return ('digit', m.group(2), False, m.group(1), m.group(3))
 
-    # 6. 罗马数字编号
+    # 罗马数字
     m = re.match(r'^([IVXLCivxlc]+(?:[.．、](?:[IVXLCivxlc]+|\d+))*)([、.．]?)\s{0,4}(.*)', text)
     if m:
         return ('roman', m.group(2), False, m.group(1), m.group(3))
 
-    # 7. 英文字母编号
+    # 英文字母
     m = re.match(r'^([A-Za-z](?:[.．、](?:[A-Za-z]|\d+))*)([、.．]?)\s{0,4}(.*)', text)
     if m:
         return ('alpha', m.group(2), False, m.group(1), m.group(3))
@@ -133,22 +134,6 @@ def is_toc_start(para):
         return True
     if text.lower() in ['contents', 'table of contents']:
         return True
-    return False
-
-def is_toc_end(para):
-    text = para.text.strip()
-    if not text:
-        return False
-    if get_heading_level_from_style(para) is not None:
-        return True
-    detected = detect_number_format(text)
-    if detected:
-        num_type, sep, has_space, num_part, rest = detected
-        title_text = clean_title_text(rest)
-        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
-        english_words = len(re.findall(r'[A-Za-z]+', title_text))
-        if chinese_chars <= 30 and english_words <= 20:
-            return True
     return False
 
 def is_heading_paragraph(para):
@@ -196,6 +181,14 @@ def is_heading_paragraph(para):
         level = 1
 
     return True, min(level, MAX_LEVEL)
+
+def get_number_key(text):
+    """获取标题编号关键部分，用于目录重复检测"""
+    detected = detect_number_format(text)
+    if detected:
+        num_type, sep, has_space, num_part, rest = detected
+        return num_part
+    return None
 
 def int_to_roman(num):
     values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
@@ -359,7 +352,6 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.scan_headings)
         layout.addWidget(self.btn_scan)
 
-        # 跳过页数设置（默认0）
         skip_row = QHBoxLayout()
         skip_row.addWidget(QLabel("跳过前几页："))
         self.spin_skip_pages = QSpinBox()
@@ -670,27 +662,39 @@ class MainWindow(QMainWindow):
             return
         self.headings = []
         self.list_headings.clear()
-        
+
         skip_pages = self.spin_skip_pages.value()
+        skip_paragraphs = skip_pages * 40
+
         in_toc = False
         toc_skipped = False
-        skip_paragraphs = skip_pages * 40
-        
+        toc_keys = set()  # 目录中出现的编号
+        manual_toc_end = False
+
         for i, para in enumerate(self.doc.paragraphs):
             if i < skip_paragraphs and not toc_skipped:
                 continue
-            
+
+            # 检测目录开始
             if not in_toc and is_toc_start(para):
                 in_toc = True
                 toc_skipped = True
                 continue
-            
-            if in_toc and is_toc_end(para):
-                in_toc = False
-            
+
             if in_toc:
-                continue
-            
+                key = get_number_key(para.text.strip())
+                if key:
+                    if key in toc_keys:
+                        # 重复编号，目录结束
+                        in_toc = False
+                    else:
+                        toc_keys.add(key)
+                        continue
+                else:
+                    # 非编号段落，继续跳过
+                    continue
+
+            # 正常识别标题
             is_heading, level = is_heading_paragraph(para)
             if is_heading:
                 detected = detect_number_format(para.text.strip())
@@ -700,14 +704,15 @@ class MainWindow(QMainWindow):
                     display_text = f"{num_part}{sep} {cleaned_text}".strip() if cleaned_text else num_part
                 else:
                     display_text = para.text.strip()
-                
+
                 self.headings.append((i, level, display_text))
                 item = QListWidgetItem(f"[{level}] {display_text}")
                 item.setData(Qt.UserRole, len(self.headings)-1)
                 self.list_headings.addItem(item)
-        
+
+        # 如果仍未识别到标题，提示手动确认
         if not self.headings:
-            QMessageBox.information(self, "提示", "未识别到标题。请检查跳过页数是否设置过大，或手动添加标题。")
+            QMessageBox.information(self, "提示", "未识别到标题，请手动从段落中选取添加标题。")
         else:
             self.statusBar().showMessage(f"识别到 {len(self.headings)} 个标题")
 
@@ -743,17 +748,14 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("选择要标记为标题的段落")
         dialog.setGeometry(200, 200, 600, 500)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("勾选要标记为标题的段落（已识别的标题置灰）："))
+        layout.addWidget(QLabel("勾选要标记为标题的段落："))
         list_widget = QListWidget()
         list_widget.setSelectionMode(QListWidget.MultiSelection)
-        heading_indices = set(h[0] for h in self.headings)
         for i, para in enumerate(self.doc.paragraphs):
             if not para.text.strip():
                 continue
             item = QListWidgetItem(f"{i+1}: {para.text.strip()[:60]}")
             item.setData(Qt.UserRole, i)
-            if i in heading_indices:
-                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
             list_widget.addItem(item)
         layout.addWidget(list_widget)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -1079,7 +1081,7 @@ class MainWindow(QMainWindow):
         if not detected:
             return
         num_type, sep, has_space, num_part, rest = detected
-        
+
         counters = [0] * MAX_LEVEL
         for i, (para_idx, level, text) in enumerate(self.headings):
             counters[level-1] += 1
