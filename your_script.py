@@ -182,14 +182,6 @@ def is_heading_paragraph(para):
 
     return True, min(level, MAX_LEVEL)
 
-def get_number_key(text):
-    """获取标题编号关键部分，用于目录重复检测"""
-    detected = detect_number_format(text)
-    if detected:
-        num_type, sep, has_space, num_part, rest = detected
-        return num_part
-    return None
-
 def int_to_roman(num):
     values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]
     symbols = ['M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I']
@@ -358,14 +350,14 @@ class MainWindow(QMainWindow):
         self.spin_skip_pages.setRange(0, 20)
         self.spin_skip_pages.setValue(0)
         skip_row.addWidget(self.spin_skip_pages)
-        skip_row.addWidget(QLabel("页（若标题被跳过请设为0）"))
+        skip_row.addWidget(QLabel("页（0表示不跳过）"))
         layout.addLayout(skip_row)
 
         self.list_headings = QListWidget()
         self.list_headings.setSelectionMode(QListWidget.MultiSelection)
         self.list_headings.setContextMenuPolicy(Qt.CustomContextMenu)
         self.list_headings.customContextMenuRequested.connect(self.show_heading_context_menu)
-        layout.addWidget(QLabel("识别到的标题（右键可管理）："))
+        layout.addWidget(QLabel("识别到的标题（带[目录]前缀的为目录区域标题，可手动删除）："))
         layout.addWidget(self.list_headings)
 
         btn_row = QHBoxLayout()
@@ -667,34 +659,17 @@ class MainWindow(QMainWindow):
         skip_paragraphs = skip_pages * 40
 
         in_toc = False
-        toc_skipped = False
-        toc_keys = set()  # 目录中出现的编号
-        manual_toc_end = False
+        toc_started = False
 
         for i, para in enumerate(self.doc.paragraphs):
-            if i < skip_paragraphs and not toc_skipped:
+            if i < skip_paragraphs:
                 continue
 
-            # 检测目录开始
-            if not in_toc and is_toc_start(para):
+            if not toc_started and is_toc_start(para):
                 in_toc = True
-                toc_skipped = True
+                toc_started = True
                 continue
 
-            if in_toc:
-                key = get_number_key(para.text.strip())
-                if key:
-                    if key in toc_keys:
-                        # 重复编号，目录结束
-                        in_toc = False
-                    else:
-                        toc_keys.add(key)
-                        continue
-                else:
-                    # 非编号段落，继续跳过
-                    continue
-
-            # 正常识别标题
             is_heading, level = is_heading_paragraph(para)
             if is_heading:
                 detected = detect_number_format(para.text.strip())
@@ -705,16 +680,16 @@ class MainWindow(QMainWindow):
                 else:
                     display_text = para.text.strip()
 
+                prefix = "[目录] " if in_toc else ""
                 self.headings.append((i, level, display_text))
-                item = QListWidgetItem(f"[{level}] {display_text}")
+                item = QListWidgetItem(f"{prefix}[{level}] {display_text}")
                 item.setData(Qt.UserRole, len(self.headings)-1)
                 self.list_headings.addItem(item)
 
-        # 如果仍未识别到标题，提示手动确认
         if not self.headings:
             QMessageBox.information(self, "提示", "未识别到标题，请手动从段落中选取添加标题。")
         else:
-            self.statusBar().showMessage(f"识别到 {len(self.headings)} 个标题")
+            self.statusBar().showMessage(f"识别到 {len(self.headings)} 个标题，目录区域标题已标记为[目录]")
 
     def show_heading_context_menu(self, pos):
         menu = QMenu()
