@@ -50,25 +50,22 @@ def convert_doc_to_docx(doc_path):
 MAX_LEVEL = 5
 
 def clean_title_text(text):
-    """清理标题文字：省略结尾非成对标点，保留右括号和？、！"""
     text = text.strip()
     if not text:
         return text
-    # 需要省略的结尾标点
     end_punctuation = '：:。；;，,、—…'
     while text and text[-1] in end_punctuation:
         text = text[:-1].rstrip()
     return text
 
 def detect_number_format(text):
-    """检测标题文本中的编号格式，返回 (编号类型, 分隔符, 是否有空格, 编号部分, 标题文字)"""
     text = text.strip()
-    # 1. 中文序号：一、 一. 一． 一 （一级）
+    # 1. 中文序号
     m = re.match(r'^([一二三四五六七八九十百千]+)([、.．]?)\s{0,4}(.*)', text)
     if m and (m.group(2) or m.group(3)):
         return ('chinese', m.group(2) or '、', False, m.group(1), m.group(3))
 
-    # 2. 括号类型：（一） （1） （A） （I） 及半角
+    # 2. 括号类型
     m = re.match(r'^[（(]([一二三四五六七八九十百千]+|\d+|[A-Za-z]+|[IVXLCivxlc]+)[）)]\s{0,4}(.*)', text)
     if m:
         inner = m.group(1)
@@ -82,7 +79,7 @@ def detect_number_format(text):
         elif re.match(r'^[IVXLCivxlc]+$', inner):
             return ('roman_paren', '', False, inner, rest)
 
-    # 3. 右括号结尾：1) 1） A) A） I) I）
+    # 3. 右括号结尾
     m = re.match(r'^(\d+|[A-Za-z]+|[IVXLCivxlc]+)([)）])\s{0,4}(.*)', text)
     if m:
         num = m.group(1)
@@ -95,12 +92,12 @@ def detect_number_format(text):
         elif re.match(r'^[IVXLCivxlc]+$', num):
             return ('roman_paren', sep, False, num, rest)
 
-    # 4. 圈号：①
+    # 4. 圈号
     m = re.match(r'^([①-⑩])\s{0,4}(.*)', text)
     if m:
         return ('circle', '', False, m.group(1), m.group(2))
 
-    # 5. 数字编号：1、1.、1.1、1.1.、1．等
+    # 5. 数字编号
     m = re.match(r'^(\d+(?:[.．]\d+)*)([、.．]?)\s{0,4}(.*)', text)
     if m:
         return ('digit', m.group(2), False, m.group(1), m.group(3))
@@ -118,25 +115,17 @@ def detect_number_format(text):
     return None
 
 def get_heading_level_from_style(para):
-    """从段落样式中获取标题层级"""
     try:
         style_name = para.style.name.lower()
-        if 'heading' in style_name:
-            match = re.search(r'heading\s*(\d+)', style_name)
-            if match:
-                level = int(match.group(1))
-                return min(level, MAX_LEVEL)
-        if '标题' in style_name:
-            match = re.search(r'标题\s*(\d+)', style_name)
-            if match:
-                level = int(match.group(1))
-                return min(level, MAX_LEVEL)
+        m = re.search(r'(heading|标题)\s*(\d+)', style_name)
+        if m:
+            level = int(m.group(2))
+            return min(level, MAX_LEVEL)
     except:
         pass
     return None
 
 def is_toc_start(para):
-    """检测是否为目录标题"""
     text = para.text.strip()
     if not text:
         return False
@@ -147,7 +136,6 @@ def is_toc_start(para):
     return False
 
 def is_toc_end(para):
-    """检测目录区域是否结束"""
     text = para.text.strip()
     if not text:
         return False
@@ -164,17 +152,14 @@ def is_toc_end(para):
     return False
 
 def is_heading_paragraph(para):
-    """判断段落是否为标题，返回 (是否, 层级)"""
     text = para.text.strip()
     if not text:
         return False, 0
 
-    # 1. 最高优先级：检查段落样式
     level = get_heading_level_from_style(para)
     if level is not None:
         return True, level
 
-    # 2. 检查编号格式
     detected = detect_number_format(text)
     if not detected:
         return False, 0
@@ -182,7 +167,6 @@ def is_heading_paragraph(para):
     num_type, sep, has_space, num_part, rest = detected
     title_text = clean_title_text(rest)
 
-    # 只有编号本身（如 4.1）也视为标题
     if not title_text:
         if num_type in ('digit', 'roman', 'alpha'):
             parts = re.findall(r'[.．]', num_part)
@@ -191,13 +175,11 @@ def is_heading_paragraph(para):
         else:
             return False, 0
 
-    # 标题文字长度检查
     chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', title_text))
     english_words = len(re.findall(r'[A-Za-z]+', title_text))
     if chinese_chars > 30 or english_words > 20:
         return False, 0
 
-    # 层级计算
     if num_type == 'digit':
         level = len(num_part.split('.'))
     elif num_type == 'roman':
@@ -377,14 +359,14 @@ class MainWindow(QMainWindow):
         self.btn_scan.clicked.connect(self.scan_headings)
         layout.addWidget(self.btn_scan)
 
-        # 跳过页数设置
+        # 跳过页数设置（默认0）
         skip_row = QHBoxLayout()
         skip_row.addWidget(QLabel("跳过前几页："))
         self.spin_skip_pages = QSpinBox()
         self.spin_skip_pages.setRange(0, 20)
-        self.spin_skip_pages.setValue(1)
+        self.spin_skip_pages.setValue(0)
         skip_row.addWidget(self.spin_skip_pages)
-        skip_row.addWidget(QLabel("页"))
+        skip_row.addWidget(QLabel("页（若标题被跳过请设为0）"))
         layout.addLayout(skip_row)
 
         self.list_headings = QListWidget()
@@ -725,7 +707,7 @@ class MainWindow(QMainWindow):
                 self.list_headings.addItem(item)
         
         if not self.headings:
-            QMessageBox.information(self, "提示", "未识别到标题")
+            QMessageBox.information(self, "提示", "未识别到标题。请检查跳过页数是否设置过大，或手动添加标题。")
         else:
             self.statusBar().showMessage(f"识别到 {len(self.headings)} 个标题")
 
