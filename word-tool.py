@@ -59,7 +59,10 @@ def clean_title_text(text):
     return text
 
 def detect_number_format(text):
-    text = text.strip()
+    # 清除所有换行符和不可见空白字符
+    text = re.sub(r'[\r\n\t\x0b\x0c\u2028\u2029]', '', text).strip()
+    if not text:
+        return None
 
     # 中文序号
     m = re.match(r'^([一二三四五六七八九十百千]+)([、.．]?)\s{0,4}(.*)', text)
@@ -137,7 +140,9 @@ def is_toc_start(para):
     return False
 
 def is_heading_paragraph(para):
-    text = para.text.strip()
+    text = para.text
+    # 清除所有换行符和不可见空白字符
+    text = re.sub(r'[\r\n\t\x0b\x0c\u2028\u2029]', '', text).strip()
     if not text:
         return False, 0
 
