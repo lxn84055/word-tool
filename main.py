@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Word 标题识别、格式统一与自动编号工具
+Word 标题识别、格式统一与重新编号工具
 依赖：pip install python-docx openpyxl
 运行：python main.py
+
+编号方案：纯文本编号，直接写入标题文字前，稳定可靠。
+处理顺序：删除旧编号 → 写入新编号 → 修改格式。
 """
 
 import os
@@ -14,22 +17,15 @@ import warnings
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore")
 
 from docx import Document
 from docx.shared import Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
-from docx.oxml import OxmlElement, parse_xml
+from docx.oxml import OxmlElement
 
 W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-
-# NUMBERING 关系类型的完整 URI（避免依赖 docx.opc.constants）
-RT_NUMBERING = (
-    'http://schemas.openxmlformats.org/officeDocument/2006/'
-    'relationships/numbering'
-)
 
 
 # =========================================================
@@ -55,9 +51,6 @@ SEP_MAP = {
 NUMFMT_PRESETS = ["阿拉伯数字", "中文数字"]
 NUMFMT_MAP = {"阿拉伯数字": "arabic", "中文数字": "chinese"}
 
-W_NUMFMT_DECIMAL = 'decimal'
-W_NUMFMT_CHINESE = 'chineseCountingThousand'
-
 TEMPLATE_HELP_TEXT = """编号模板编写原则
 ============================
 
@@ -78,11 +71,7 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
 四、启用/禁用
     格式面板、编号面板每级都有启用复选框，可只对某一级生效。
 
-五、编号实现
-    优先使用 Word 原生多级自动编号（w:numPr）；
-    若文档无法承载编号定义，则自动回退为纯文本编号。
-
-六、常见示例
+五、常见示例
     一级：第{1}章 / 第一章
     二级：{1}.{2} / 第{1}节
     三级：{1}.{2}.{3} / （{3}）
@@ -90,7 +79,7 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
 
 
 # =========================================================
-# 中文数字转换
+# 中文数字
 # =========================================================
 
 _CN_DIGITS = '零一二三四五六七八九'
@@ -292,7 +281,7 @@ def remove_old_number(text):
 
 
 # =========================================================
-# 编号生成（纯文本）
+# 编号生成
 # =========================================================
 
 def generate_numbers(titles, templates, separators,
@@ -338,10 +327,11 @@ def generate_numbers(titles, templates, separators,
 
 
 # =========================================================
-# python-docx 段落 / 样式处理
+# 段落文字处理
 # =========================================================
 
 def _replace_paragraph_text_preserving_format(p, new_text):
+    """保留第一个非空 run 的格式，替换整段文字。"""
     runs = list(p.runs)
     if not runs:
         p.add_run(new_text)
@@ -359,13 +349,8 @@ def _replace_paragraph_text_preserving_format(p, new_text):
             r._element.getparent().remove(r._element)
 
 
-def _set_paragraph_text(p, text):
-    for r in list(p.runs):
-        r._element.getparent().remove(r._element)
-    p.add_run(text)
-
-
 def _remove_paragraph_numbering(p):
+    """删除段落级自动编号 w:numPr。"""
     pPr = p._p.pPr
     if pPr is None:
         return
@@ -375,6 +360,7 @@ def _remove_paragraph_numbering(p):
 
 
 def _remove_style_numbering(doc, num_levels=None):
+    """删除标题样式上的自动编号定义。"""
     for lvl in range(1, 10):
         if num_levels is not None and lvl not in num_levels:
             continue
@@ -442,332 +428,45 @@ def _apply_format_to_styles(doc, format_settings):
             break
 
 
-def _prepare_titles_for_numbering(doc, title_list, num_levels):
-    for t in title_list:
-        lvl = t['level']
-        if num_levels is not None and lvl not in num_levels:
-            continue
-        idx = t['index']
-        if idx >= len(doc.paragraphs):
-            continue
-        p = doc.paragraphs[idx]
-        clean = remove_old_number(p.text)
-        if clean != p.text:
-            _replace_paragraph_text_preserving_format(p, clean)
-        _remove_paragraph_numbering(p)
-
-
-def _apply_heading_styles_for_titles(doc, title_list, fmt_levels):
-    for t in title_list:
-        lvl = t['level']
-        if fmt_levels is not None and lvl not in fmt_levels:
-            continue
-        idx = t['index']
-        if idx >= len(doc.paragraphs):
-            continue
-        p = doc.paragraphs[idx]
-        _apply_heading_style(p, doc, lvl)
-
-
-def _clean_and_style(doc, title_list, fmt_levels, num_levels):
-    _remove_style_numbering(doc, num_levels)
-    _prepare_titles_for_numbering(doc, title_list, num_levels)
-    _apply_heading_styles_for_titles(doc, title_list, fmt_levels)
-
-
 # =========================================================
-# ★ 编号 Part 操作（完全避免 NumberingPart.new()）
+# 核心导出
 # =========================================================
 
-def _find_numbering_part(doc):
-    """遍历 OPC 关系查找 numbering part，找不到返回 None。"""
-    try:
-        for rel in doc.part.rels.values():
-            try:
-                if rel.reltype and rel.reltype.endswith('/numbering'):
-                    return rel.target_part
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return None
-
-
-def _ensure_numbering_element(doc):
+def export_document(src_path, out_path, titles, format_settings,
+                    templates, separators, number_formats,
+                    fmt_levels, num_levels,
+                    apply_format=True, progress_cb=None):
     """
-    返回 <w:numbering> 根元素。
-    优先复用已有 part；没有则创建一个新的 numbering part。
-    全程不触碰 doc.part.numbering_part（会触发 NotImplementedError）。
+    处理顺序：
+      1. 删除旧编号（文本 + 段落级 w:numPr + 样式级 w:numPr）
+      2. 写入新编号（纯文本，插入标题前）
+      3. 修改格式（应用标题样式 + 修改样式属性）
+      4. 另存为新文件
     """
-    # 1. 查找已有 part
-    part = _find_numbering_part(doc)
-    if part is not None:
-        # 尝试读取 element
-        el = getattr(part, '_element', None)
-        if el is not None:
-            return el
-        # 从 blob 解析
-        try:
-            blob = getattr(part, '_blob', None) or getattr(part, 'blob', None)
-            if blob:
-                el = parse_xml(blob)
-                try:
-                    part._element = el
-                except Exception:
-                    pass
-                return el
-        except Exception:
-            traceback.print_exc()
-
-    # 2. 创建新 part
-    try:
-        from docx.opc.part import XmlPart
-        from docx.opc.packuri import PackURI
-    except Exception:
-        traceback.print_exc()
-        return None
-
-    try:
-        content_type = (
-            'application/vnd.openxmlformats-officedocument'
-            '.wordprocessingml.numbering+xml'
-        )
-        partname = PackURI('/word/numbering.xml')
-        xml_bytes = (
-            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
-            b'<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
-            b'wordprocessingml/2006/main"/>'
-        )
-        element = parse_xml(xml_bytes)
-
-        new_part = XmlPart(
-            partname, content_type, element, doc.part.package)
-
-        # 建立 document part → numbering part 的关系
-        doc.part.relate_to(new_part, RT_NUMBERING)
-        return element
-    except Exception:
-        traceback.print_exc()
-        return None
-
-
-def _next_abstract_num_id(numbering_elm):
-    ids = []
-    for a in numbering_elm.findall(qn('w:abstractNum')):
-        v = a.get(qn('w:abstractNumId'))
-        if v is not None:
-            try:
-                ids.append(int(v))
-            except ValueError:
-                pass
-    return (max(ids) + 1) if ids else 1000
-
-
-def _next_num_id(numbering_elm):
-    ids = []
-    for n in numbering_elm.findall(qn('w:num')):
-        v = n.get(qn('w:numId'))
-        if v is not None:
-            try:
-                ids.append(int(v))
-            except ValueError:
-                pass
-    return (max(ids) + 1) if ids else 1000
-
-
-def _add_multilevel_numbering_to_doc(doc, templates, separators,
-                                     number_formats):
-    numbering_elm = _ensure_numbering_element(doc)
-    if numbering_elm is None:
-        return None
-
-    new_abs_id = _next_abstract_num_id(numbering_elm)
-    new_num_id = _next_num_id(numbering_elm)
-
-    # abstractNum
-    abs_el = OxmlElement('w:abstractNum')
-    abs_el.set(qn('w:abstractNumId'), str(new_abs_id))
-
-    mlt = OxmlElement('w:multiLevelType')
-    mlt.set(qn('w:val'), 'multilevel')
-    abs_el.append(mlt)
-
-    for lvl in range(1, 10):
-        lvl_el = OxmlElement('w:lvl')
-        lvl_el.set(qn('w:ilvl'), str(lvl - 1))
-
-        start_el = OxmlElement('w:start')
-        start_el.set(qn('w:val'), '1')
-        lvl_el.append(start_el)
-
-        num_fmt_el = OxmlElement('w:numFmt')
-        fmt = number_formats.get(lvl, 'arabic')
-        num_fmt_el.set(qn('w:val'),
-                       W_NUMFMT_CHINESE if fmt == 'chinese'
-                       else W_NUMFMT_DECIMAL)
-        lvl_el.append(num_fmt_el)
-
-        tmpl = templates.get(lvl)
-        if tmpl:
-            w_tmpl = re.sub(r'\{(\d+)\}', lambda m: '%' + m.group(1), tmpl)
-            w_tmpl = re.sub(r'\{\d+\}', '', w_tmpl)
-            sep = separators.get(lvl, ' ')
-            text_val = w_tmpl + sep
-        else:
-            text_val = '%' + str(lvl) + '.'
-
-        lvl_text_el = OxmlElement('w:lvlText')
-        lvl_text_el.set(qn('w:val'), text_val)
-        lvl_el.append(lvl_text_el)
-
-        lvl_jc = OxmlElement('w:lvlJc')
-        lvl_jc.set(qn('w:val'), 'left')
-        lvl_el.append(lvl_jc)
-
-        ppr = OxmlElement('w:pPr')
-        ind = OxmlElement('w:ind')
-        ind.set(qn('w:left'), '0')
-        ind.set(qn('w:firstLine'), '0')
-        ppr.append(ind)
-        lvl_el.append(ppr)
-
-        abs_el.append(lvl_el)
-
-    first_num = numbering_elm.find(qn('w:num'))
-    if first_num is not None:
-        first_num.addprevious(abs_el)
-    else:
-        numbering_elm.append(abs_el)
-
-    num_el = OxmlElement('w:num')
-    num_el.set(qn('w:numId'), str(new_num_id))
-    abs_ref = OxmlElement('w:abstractNumId')
-    abs_ref.set(qn('w:val'), str(new_abs_id))
-    num_el.append(abs_ref)
-    numbering_elm.append(num_el)
-
-    return new_num_id
-
-
-def _apply_numpr_to_paragraph(p, num_id, level):
-    pPr = p._p.get_or_add_pPr()
-    old = pPr.find(qn('w:numPr'))
-    if old is not None:
-        pPr.remove(old)
-    numPr = pPr.get_or_add_numPr()
-    numPr.get_or_add_ilvl().val = level - 1
-    numPr.get_or_add_numId().val = num_id
-
-
-def _apply_text_numbers(doc, title_list, templates, separators,
-                        number_formats, num_levels):
-    sorted_titles = sorted(title_list, key=lambda x: x['index'])
-    nums = generate_numbers(sorted_titles, templates, separators,
-                            number_formats, num_levels)
-    for t, num in zip(sorted_titles, nums):
-        if not num:
-            continue
-        idx = t['index']
-        if idx >= len(doc.paragraphs):
-            continue
-        p = doc.paragraphs[idx]
-        clean = remove_old_number(p.text)
-        _replace_paragraph_text_preserving_format(p, num + clean)
-
-
-# =========================================================
-# 导出核心
-# =========================================================
-
-def _run_numbering(doc, title_list, templates, separators,
-                   number_formats, num_levels, use_auto_number,
-                   progress_cb, base_pct, span_pct):
-    def report(p, m=None):
+    def report(pct, msg=None):
         if progress_cb:
             try:
-                progress_cb(p, m)
+                progress_cb(pct, msg)
             except Exception:
                 pass
 
-    if not num_levels:
-        return False
-
-    targets = [t for t in title_list if t['level'] in num_levels]
-
-    if use_auto_number:
-        report(base_pct, "创建 Word 多级自动编号...")
-        num_id = None
-        try:
-            num_id = _add_multilevel_numbering_to_doc(
-                doc, templates, separators, number_formats)
-        except Exception:
-            traceback.print_exc()
-            num_id = None
-
-        if num_id is not None:
-            total = max(1, len(targets))
-            for i, t in enumerate(targets, 1):
-                idx = t['index']
-                if idx >= len(doc.paragraphs):
-                    continue
-                p = doc.paragraphs[idx]
-                _apply_numpr_to_paragraph(p, num_id, t['level'])
-                if i % 5 == 0 or i == total:
-                    report(base_pct + int(span_pct * i / total),
-                           f"应用自动编号 {i}/{total}")
-            return True
-
-        report(base_pct + span_pct // 2,
-               "自动编号创建失败，改用纯文本编号...")
-
-    _apply_text_numbers(doc, title_list, templates, separators,
-                        number_formats, num_levels)
-    return False
-
-
-def text_only_export_reformat(src_path, out_path, title_list,
-                              format_settings, templates, separators,
-                              number_formats, fmt_levels, num_levels,
-                              use_auto_number=True, progress_cb=None):
-    def report(p, m=None):
-        if progress_cb:
-            try:
-                progress_cb(p, m)
-            except Exception:
-                pass
+    report(3, "准备标题列表...")
+    title_list = [
+        t for t in titles
+        if t.get('is_title') and isinstance(t.get('level'), int)
+        and 1 <= t['level'] <= 9
+    ]
+    title_list.sort(key=lambda x: x['index'])
+    if not title_list:
+        raise RuntimeError("没有可导出的有效标题")
 
     report(10, "读取原文档...")
     doc = Document(src_path)
 
-    report(20, "清理原编号、应用标题样式...")
-    _clean_and_style(doc, title_list, fmt_levels, num_levels)
-    _apply_format_to_styles(doc, format_settings)
-
-    used_auto = _run_numbering(
-        doc, title_list, templates, separators, number_formats,
-        num_levels, use_auto_number, progress_cb, 40, 50)
-
-    report(92, "保存文档...")
-    doc.save(out_path)
-    return used_auto
-
-
-def text_only_export_renumber(src_path, out_path, title_list,
-                              templates, separators, number_formats,
-                              num_levels, use_auto_number=True,
-                              progress_cb=None):
-    def report(p, m=None):
-        if progress_cb:
-            try:
-                progress_cb(p, m)
-            except Exception:
-                pass
-
-    report(10, "读取原文档...")
-    doc = Document(src_path)
-
-    report(20, "清理原编号...")
+    # ---------- 1. 删除旧编号 ----------
+    report(20, "删除旧编号...")
     _remove_style_numbering(doc, num_levels)
+    clean_count = 0
     for t in title_list:
         if t['level'] not in num_levels:
             continue
@@ -779,55 +478,51 @@ def text_only_export_renumber(src_path, out_path, title_list,
         if clean != p.text:
             _replace_paragraph_text_preserving_format(p, clean)
         _remove_paragraph_numbering(p)
+        clean_count += 1
 
-    used_auto = _run_numbering(
-        doc, title_list, templates, separators, number_formats,
-        num_levels, use_auto_number, progress_cb, 40, 50)
+    # ---------- 2. 写入新编号（纯文本） ----------
+    report(40, "生成新编号...")
+    nums = generate_numbers(title_list, templates, separators,
+                            number_formats, num_levels)
 
-    report(92, "保存文档...")
+    report(50, "写入新编号...")
+    written = 0
+    total_num = sum(1 for x in nums if x)
+    for t, num in zip(title_list, nums):
+        if not num:
+            continue
+        idx = t['index']
+        if idx >= len(doc.paragraphs):
+            continue
+        p = doc.paragraphs[idx]
+        # 此时 p.text 已经去掉旧编号，直接前插新编号
+        new_text = num + p.text
+        _replace_paragraph_text_preserving_format(p, new_text)
+        written += 1
+        if total_num and (written % 5 == 0 or written == total_num):
+            report(50 + int(20 * written / total_num),
+                   f"写入编号 {written}/{total_num}")
+
+    # ---------- 3. 修改格式 ----------
+    if apply_format:
+        report(75, "应用标题样式与格式...")
+        for t in title_list:
+            lvl = t['level']
+            if lvl not in fmt_levels:
+                continue
+            idx = t['index']
+            if idx >= len(doc.paragraphs):
+                continue
+            p = doc.paragraphs[idx]
+            _apply_heading_style(p, doc, lvl)
+
+        report(85, "应用样式属性...")
+        _apply_format_to_styles(doc, format_settings)
+
+    # ---------- 4. 保存 ----------
+    report(95, "保存文档...")
     doc.save(out_path)
-    return used_auto
-
-
-def export_document(src_path, out_path, titles, format_settings,
-                    templates, separators, number_formats,
-                    fmt_levels, num_levels,
-                    use_auto_number=True, apply_format=True,
-                    progress_cb=None):
-    def report(p, m=None):
-        if progress_cb:
-            try:
-                progress_cb(p, m)
-            except Exception:
-                pass
-
-    report(3, "准备标题列表...")
-    title_list = [
-        t for t in titles
-        if t.get('is_title') and isinstance(t.get('level'), int)
-        and 1 <= t['level'] <= 9
-    ]
-    title_list.sort(key=lambda x: x['index'])
-
-    if not title_list:
-        raise RuntimeError("没有可导出的有效标题")
-
-    if not apply_format:
-        used_auto = text_only_export_renumber(
-            src_path, out_path, title_list,
-            templates, separators, number_formats, num_levels,
-            use_auto_number=use_auto_number,
-            progress_cb=progress_cb)
-    else:
-        used_auto = text_only_export_reformat(
-            src_path, out_path, title_list,
-            format_settings, templates, separators,
-            number_formats, fmt_levels, num_levels,
-            use_auto_number=use_auto_number,
-            progress_cb=progress_cb)
-
     report(100, "完成")
-    return used_auto
 
 
 # =========================================================
@@ -1201,7 +896,7 @@ class AddParagraphDialog:
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("Word 标题识别、格式统一与自动编号工具")
+        self.root.title("Word 标题识别、格式统一与重新编号工具")
 
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
@@ -1381,15 +1076,8 @@ class App:
             self.numfmt_vars[lvl] = nv
 
         ttk.Label(num_wrap,
-                  text="提示：编号为 Word 原生多级自动编号，可在 Word 中继续编辑。",
+                  text="提示：编号为纯文本，直接写入标题前，稳定可靠。",
                   foreground='#666').pack(anchor='w', padx=8, pady=(2, 4))
-
-        self.auto_number_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(
-            num_wrap,
-            text="应用为 Word 自动编号（失败自动回退纯文本编号）",
-            variable=self.auto_number_var).pack(
-            anchor='w', padx=6, pady=(0, 4))
 
     def _run_with_progress(self, work, on_done=None, title="处理中..."):
         dlg = ProgressDialog(self.root, title=title)
@@ -1827,19 +1515,17 @@ class App:
 
         fmt_str = ','.join(str(x) for x in sorted(fmt_levels)) or '无'
         num_str = ','.join(str(x) for x in sorted(num_levels)) or '无'
-        use_auto_number = self.auto_number_var.get()
 
         def work(progress_cb):
-            return export_document(
+            export_document(
                 self.src_path, out_path, title_list, format_settings,
                 templates, separators, number_formats,
                 fmt_levels, num_levels,
-                use_auto_number=use_auto_number,
                 apply_format=apply_format,
                 progress_cb=progress_cb)
+            return True
 
-        def on_done(used_auto):
-            method = "Word 自动编号" if used_auto else "纯文本编号"
+        def on_done(_):
             mode_txt = ("修改格式 + 重新编号" if apply_format
                         else "只重新编号")
             messagebox.showinfo(
@@ -1847,7 +1533,7 @@ class App:
                 f"[{mode_txt}]\n"
                 f"  修改格式的级别：{fmt_str}\n"
                 f"  重新编号的级别：{num_str}\n"
-                f"  编号方式：{method}\n"
+                f"  编号方式：纯文本编号（稳定可靠）\n"
                 f"  输出文件：\n{out_path}")
 
         self._run_with_progress(work, on_done=on_done,
