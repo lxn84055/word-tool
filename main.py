@@ -3,6 +3,9 @@
 Word 工具集
 依赖：pip install python-docx openpyxl
 运行：python main.py
+
+Tab1：标题处理（识别、重编号、格式统一）
+Tab2：表格/正文提取到 Excel
 """
 
 import os
@@ -124,6 +127,11 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
       - 右键点击标题行 → "设为正文开始" / "设为正文结束"
       - 如果"正文结束"是最后一个标题，它之后的段落一直
         到文档末尾都算正文。
+
+六、导出清单
+    "导出清单时去除编号"复选框：
+      - 勾选：导出清单的"标题文字"列去掉原编号
+      - 不勾选：保留原标题文字
 """
 
 
@@ -722,8 +730,17 @@ def _export_titles_text(titles, nums, file_path):
 
 
 def export_titles_list(titles, file_path, templates, separators,
-                       number_formats, num_levels=None):
+                       number_formats, num_levels=None,
+                       strip_number=False):
+    """
+    strip_number=True 时，导出的"标题文字"列会去掉标题原有的编号。
+    """
     sorted_titles = sorted(titles, key=lambda x: x['index'])
+    if strip_number:
+        sorted_titles = [
+            {**t, 'text': remove_old_number(t.get('text', ''))}
+            for t in sorted_titles
+        ]
     nums = generate_numbers(sorted_titles, templates, separators,
                             number_formats, num_levels)
     ext = os.path.splitext(file_path)[1].lower()
@@ -759,7 +776,6 @@ def _is_heading_paragraph(p):
          - 多级数字编号："7.8"、"7.8.1"、"7.8.1.2" 等
          - "第X章/节/篇/部分/编"
     """
-    # 1. 样式名
     try:
         style_name = p.style.name if p.style else ''
     except Exception:
@@ -768,7 +784,6 @@ def _is_heading_paragraph(p):
         if re.match(r'^(?:Heading|标题)\s*\d+', style_name.strip(), re.I):
             return True
 
-    # 2. 大纲级别
     try:
         pPr = p._p.pPr
         if pPr is not None:
@@ -785,17 +800,14 @@ def _is_heading_paragraph(p):
     except Exception:
         pass
 
-    # 3. 编号模式
     try:
         text = p.text.strip()
     except Exception:
         text = ''
     if not text:
         return False
-    # 多级数字编号："7.8" / "7.8.1" 后面跟空白、标点或行尾
     if re.match(r'^\d+(?:[\.．]\d+)+(?:\s|$|[、：:\.．])', text):
         return True
-    # "第X章/节/篇/部分/编"
     if re.match(r'^第[一二三四五六七八九十百千万零〇\d]+[章节篇部分编]', text):
         return True
 
@@ -855,7 +867,7 @@ def _parse_paragraph_block(paragraphs):
 def _parse_cell_blocks(cell):
     """
     解析单个单元格，按标题段落切分成多个数据块，
-    返回 list[dict]。每个 dict 对应 Excel 的一行。
+    返回 list[dict]。
     """
     try:
         paragraphs = list(cell.paragraphs)
@@ -883,9 +895,7 @@ def _parse_cell_blocks(cell):
 
 
 def _unique_cells(row):
-    """
-    取一行的唯一单元格（去掉合并单元格的重复项）。
-    """
+    """取一行的唯一单元格（去掉合并单元格的重复项）。"""
     seen = set()
     result = []
     try:
@@ -911,13 +921,6 @@ def _unique_cells(row):
 def _parse_one_table(table):
     """
     解析一个表格，返回 list[dict]（每 dict 对应 Excel 一行）。
-
-    处理策略：
-      - 1 行 1 列：整个单元格按标题切分成多个数据块
-      - 多行表格：
-          · 某一行的多个单元格都较短且都无冒号时，视作 key-value 行
-            （例如 "归属部门 | 技术中心 | 版本号 | A0 | 生效日期 | 2026-03-27"）
-          · 其他行：逐个单元格按块解析（支持合并单元格内的长文本）
     """
     rows = []
     try:
@@ -943,7 +946,6 @@ def _parse_one_table(table):
             continue
         texts = [c.text.strip() for c in cells]
 
-        # 判断该行是否为 key-value 行
         is_kv_row = False
         if len(cells) >= 2:
             all_short = all(len(t) < 30 for t in texts)
@@ -959,7 +961,6 @@ def _parse_one_table(table):
                 v = texts[i + 1]
                 if k:
                     row_data[k] = v
-            # 奇数个单元格，最后一个作为 key（值空）
             if len(texts) % 2 == 1:
                 k = texts[-1]
                 if k:
@@ -968,7 +969,6 @@ def _parse_one_table(table):
                 rows.append(row_data)
             continue
 
-        # 其他行：逐个单元格解析
         for c in cells:
             blocks = _parse_cell_blocks(c)
             if blocks:
@@ -978,9 +978,7 @@ def _parse_one_table(table):
 
 
 def extract_from_body_paragraphs(doc):
-    """
-    从正文段落（排除表格内）中提取 "列名: 内容" 数据。
-    """
+    """从正文段落（排除表格内）中提取 "列名: 内容" 数据。"""
     from docx.text.paragraph import Paragraph
 
     body_paragraphs = []
@@ -1018,7 +1016,6 @@ def extract_tables_from_word(docx_path):
     doc = Document(docx_path)
     rows = []
 
-    # 1. 提取所有表格
     for table in doc.tables:
         try:
             table_rows = _parse_one_table(table)
@@ -1027,14 +1024,12 @@ def extract_tables_from_word(docx_path):
             table_rows = []
         rows.extend(table_rows)
 
-    # 2. 提取正文段落（排除表格内）
     try:
         body_rows = extract_from_body_paragraphs(doc)
         rows.extend(body_rows)
     except Exception:
         traceback.print_exc()
 
-    # 汇总列名（按首次出现顺序）
     columns = []
     seen = set()
     for r in rows:
@@ -1066,7 +1061,6 @@ def export_tables_to_excel(columns, rows, file_path):
     for r in rows:
         ws.append([r.get(c, '') for c in columns])
 
-    # 列宽自适应
     for i, col in enumerate(columns, 1):
         max_len = len(str(col))
         for r in rows:
@@ -1579,6 +1573,8 @@ class App(ttk.Frame):
         self.num_enabled_vars = {}
 
         self.include_table_var = tk.BooleanVar(value=True)
+        # ★ 导出清单是否去除编号
+        self.strip_number_var = tk.BooleanVar(value=True)
 
         self.body_start_idx = None
         self.body_end_idx = None
@@ -1636,6 +1632,11 @@ class App(ttk.Frame):
                    command=self._invert_checked).pack(side=tk.LEFT, padx=2)
         ttk.Button(quick, text="切换选中 (空格)", width=14,
                    command=self._toggle_selected).pack(side=tk.LEFT, padx=2)
+
+        # ★ 新增：导出清单去除编号
+        ttk.Checkbutton(quick, text="导出清单时去除编号",
+                        variable=self.strip_number_var).pack(
+            side=tk.LEFT, padx=10)
 
         self.body_range_var = tk.StringVar(
             value="正文范围：未设置（右键标题行可设置）")
@@ -2410,9 +2411,11 @@ class App(ttk.Frame):
         templates = self._collect_templates()
         separators = self._collect_separators()
         number_formats = self._collect_number_formats()
+        strip = bool(self.strip_number_var.get())
         try:
             export_titles_list(title_list, path, templates, separators,
-                               number_formats, None)
+                               number_formats, None,
+                               strip_number=strip)
             messagebox.showinfo("完成", f"已导出标题清单：\n{path}")
         except Exception as e:
             traceback.print_exc()
@@ -2478,7 +2481,6 @@ class TableExtractApp(ttk.Frame):
             text=(
                 "· 提取范围：所有表格 + 正文段落（正文排除表格内的）\n"
                 "· 多行表格：短且无冒号的 key-value 行识别为一行数据\n"
-                "  （例：归属部门|技术中心|版本号|A0|生效日期|2026-03-27）\n"
                 "· 合并大单元格：按标题段落切分成多个数据块，每块 Excel 一行\n"
                 "· 标题判定：Word 标题样式 / 大纲级别 / 编号模式\n"
                 "  （如 \"7.8 上下电测试\"、\"7.8.1 xxx\"、\"第X章 xxx\"）\n"
