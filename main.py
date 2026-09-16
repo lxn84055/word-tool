@@ -62,6 +62,7 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
          三级：{1}.{2}.{3}、{2}.{3} 或 {3}
     2. 超出本级的占位符会被自动清除。
     3. 下级序号会随上级标题出现而自动重置为 1。
+    4. 若上级标题未出现，上级序号按 1 显示（不会出现 0.1、0.0.1）。
 
 三、常见示例
     一级模板        生成效果
@@ -170,7 +171,6 @@ def detect_heading(para):
     return None, None
 
 
-# ★ 扩展：覆盖更多编号格式
 def remove_old_number(text):
     patterns = [
         # 中文编号：第X章 / 第X节 / 第X篇 / 第X部分 / 第X编
@@ -198,10 +198,15 @@ def remove_old_number(text):
 
 
 # =========================================================
-# 编号生成
+# 编号生成（★ 父级为 0 时按 1 显示）
 # =========================================================
 
 def generate_numbers(titles, templates, separators):
+    """为标题序列生成编号前缀。
+
+    - 只有 is_title=True 且 level 有效（1~9）的项才计数并生成编号。
+    - 父级计数器为 0（即上级标题尚未出现）时，按 1 显示，避免 0.1、0.0.1。
+    """
     counters = [0] * 10
     result = []
     for t in titles:
@@ -225,7 +230,11 @@ def generate_numbers(titles, templates, separators):
         tmpl = templates.get(level, '{' + str(level) + '}')
         s = tmpl
         for i in range(1, level + 1):
-            s = s.replace('{' + str(i) + '}', str(counters[i - 1]))
+            cnt = counters[i - 1]
+            # ★ 父级计数器为 0（未出现过上级标题）时按 1 显示
+            if cnt == 0:
+                cnt = 1
+            s = s.replace('{' + str(i) + '}', str(cnt))
         s = re.sub(r'\{\d+\}', '', s)
         result.append(s + separators.get(level, ' '))
     return result
@@ -263,7 +272,6 @@ def _replace_paragraph_text_preserving_format(p, new_text):
             r._element.getparent().remove(r._element)
 
 
-# ★ 新增：清除段落级自动编号（w:numPr）
 def _remove_paragraph_numbering(p):
     """移除段落上的 w:numPr，用于清除 Word 自动编号"""
     pPr = p._p.pPr
@@ -274,12 +282,8 @@ def _remove_paragraph_numbering(p):
         pPr.remove(numPr)
 
 
-# ★ 新增：清除内置标题样式上定义的自动编号
 def _remove_style_numbering(doc):
-    """
-    移除"标题 1"~"标题 9" / "Heading 1"~"Heading 9" 样式上定义的
-    w:numPr，避免样式关联的自动编号在段落上继续显示。
-    """
+    """移除"标题 N"样式上定义的自动编号"""
     for lvl in range(1, 10):
         for name in (f"标题 {lvl}", f"Heading {lvl}"):
             try:
@@ -345,22 +349,16 @@ def _apply_format_to_styles(doc, format_settings):
             break
 
 
-# ★ 修改：_clean_and_style 增加清除自动编号
 def _clean_and_style(doc, title_list, apply_heading_style=True):
-    # 先清除所有标题样式上定义的自动编号
     _remove_style_numbering(doc)
-
     for t in title_list:
         idx = t['index']
         if idx >= len(doc.paragraphs):
             continue
         p = doc.paragraphs[idx]
-        # 删除纯文本编号
         clean = remove_old_number(p.text)
         _set_paragraph_text(p, clean)
-        # ★ 清除段落级自动编号
         _remove_paragraph_numbering(p)
-        # 应用标题样式
         if apply_heading_style:
             _apply_heading_style(p, doc, t['level'])
 
@@ -535,11 +533,9 @@ def text_only_export_reformat(src_path, out_path, title_list,
     doc.save(out_path)
 
 
-# ★ 修改：只重新编号也清除段落级和样式级自动编号
 def text_only_export_renumber(src_path, out_path, title_list,
                               templates, separators):
     doc = Document(src_path)
-    # ★ 清除样式上的自动编号定义
     _remove_style_numbering(doc)
 
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
@@ -553,10 +549,8 @@ def text_only_export_renumber(src_path, out_path, title_list,
         if idx >= len(doc.paragraphs):
             continue
         p = doc.paragraphs[idx]
-        # 删除纯文本编号并保留原格式
         clean = remove_old_number(p.text)
         _replace_paragraph_text_preserving_format(p, num + clean)
-        # ★ 清除段落级自动编号
         _remove_paragraph_numbering(p)
 
     doc.save(out_path)
