@@ -27,11 +27,20 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
 
+# 关系类型：优先用官方常量，拿不到就用字符串兜底
 try:
     from docx.opc.constants import RELATIONSHIP_TYPE as RT
-    from docx.opc.packuri import PackURI
+    RT_NUMBERING = RT.NUMBERING
 except Exception:
     RT = None
+    RT_NUMBERING = (
+        'http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/numbering'
+    )
+
+try:
+    from docx.opc.packuri import PackURI
+except Exception:
     PackURI = None
 
 W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
@@ -60,7 +69,6 @@ SEP_MAP = {
 NUMFMT_PRESETS = ["阿拉伯数字", "中文数字"]
 NUMFMT_MAP = {"阿拉伯数字": "arabic", "中文数字": "chinese"}
 
-# Word numFmt 取值
 W_NUMFMT_DECIMAL = 'decimal'
 W_NUMFMT_CHINESE = 'chineseCountingThousand'
 
@@ -492,22 +500,48 @@ def _clean_and_style(doc, title_list, fmt_levels, num_levels):
 def _ensure_numbering_element(doc):
     """
     确保文档有 numbering part，返回它的根元素 <w:numbering>。
-    若不存在则新建一个并建立关系。
+
+    注意：
+      - 不能通过 doc.part.numbering_part 属性访问，因为当文档没有
+        numbering part 时，该属性会自动调用 NumberingPart.new()，
+        而 python-docx 的 NumberingPart.new() 未实现，会抛
+        NotImplementedError。
+      - 改用 part_related_by(RT.NUMBERING) 直接查询关系。
+      - 创建新 part 时使用 XmlPart 而非 NumberingPart。
     """
-    # 1. 已有 numbering part（大多数 Word 文档都有）
+    # ---------- 1. 尝试获取已有 numbering part ----------
+    part = None
     try:
-        part = doc.part.numbering_part
-        if part is not None and part.element is not None:
-            return part.element
+        part = doc.part.part_related_by(RT_NUMBERING)
+    except KeyError:
+        part = None
     except Exception:
-        pass
+        traceback.print_exc()
+        part = None
 
-    # 2. 创建新的 numbering part（用 NumberingPart.load，而非 new）
+    if part is not None:
+        el = getattr(part, '_element', None)
+        if el is None:
+            try:
+                el = parse_xml(part.blob)
+                try:
+                    part._element = el
+                except Exception:
+                    pass
+            except Exception:
+                traceback.print_exc()
+                el = None
+        if el is not None:
+            return el
+
+    # ---------- 2. 新建 numbering part ----------
     try:
-        from docx.parts.numbering import NumberingPart
+        from docx.opc.part import XmlPart
 
-        content_type = ('application/vnd.openxmlformats-officedocument'
-                        '.wordprocessingml.numbering+xml')
+        content_type = (
+            'application/vnd.openxmlformats-officedocument'
+            '.wordprocessingml.numbering+xml'
+        )
         partname = PackURI('/word/numbering.xml')
 
         xml_bytes = (
@@ -515,12 +549,14 @@ def _ensure_numbering_element(doc):
             b'<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
             b'wordprocessingml/2006/main"/>'
         )
+        element = parse_xml(xml_bytes)
 
-        part = NumberingPart.load(
-            partname, content_type, xml_bytes, doc.part.package)
-        if RT is not None:
-            doc.part.relate_to(part, RT.NUMBERING)
-        return part.element
+        new_part = XmlPart(
+            partname, content_type, element, doc.part.package)
+
+        doc.part.relate_to(new_part, RT_NUMBERING)
+
+        return element
     except Exception:
         traceback.print_exc()
         return None
@@ -552,9 +588,6 @@ def _next_num_id(numbering_elm):
 
 def _add_multilevel_numbering_to_doc(doc, templates, separators,
                                      number_formats):
-    """
-    在文档里创建一个多级编号定义，返回新 numId。
-    """
     numbering_elm = _ensure_numbering_element(doc)
     if numbering_elm is None:
         return None
@@ -586,7 +619,6 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
             num_fmt_el.set(qn('w:val'), W_NUMFMT_DECIMAL)
         lvl_el.append(num_fmt_el)
 
-        # lvlText
         tmpl = templates.get(lvl)
         if tmpl:
             w_tmpl = re.sub(r'\{(\d+)\}', lambda m: '%' + m.group(1), tmpl)
@@ -666,7 +698,6 @@ def _apply_text_numbers(doc, title_list, templates, separators,
 def _run_numbering(doc, title_list, templates, separators,
                    number_formats, num_levels, use_auto_number,
                    progress_cb, base_pct, span_pct):
-    """应用编号（自动或纯文本），返回是否使用了自动编号。"""
     def report(p, m=None):
         if progress_cb:
             try:
@@ -704,7 +735,6 @@ def _run_numbering(doc, title_list, templates, separators,
         report(base_pct + span_pct // 2,
                "自动编号创建失败，改用纯文本编号...")
 
-    # 纯文本回退
     _apply_text_numbers(doc, title_list, templates, separators,
                         number_formats, num_levels)
     return False
@@ -1373,7 +1403,6 @@ class App:
             variable=self.auto_number_var).pack(
             anchor='w', padx=6, pady=(0, 4))
 
-    # ---------- 进度 ----------
     def _run_with_progress(self, work, on_done=None, title="处理中..."):
         dlg = ProgressDialog(self.root, title=title)
         q = queue.Queue()
@@ -1414,7 +1443,6 @@ class App:
 
         poll()
 
-    # ---------- 勾选辅助 ----------
     def _get_all_iids(self):
         return list(self.tree.get_children())
 
