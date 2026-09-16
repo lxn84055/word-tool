@@ -1,8 +1,19 @@
 # -*- coding: utf-8 -*-
 """
 Word 标题识别、格式统一与自动编号工具
+
+功能：
+    - 识别 Word 中的标题（大纲级别 / 内置样式 / 编号模式 / 手动标记）
+    - 在列表中增删改标题、调整级别、修改文字
+    - 按级别统一设置标题格式（字体/字号/加粗/颜色/对齐/间距）
+    - 按级别配置编号模板与分隔符（下拉选择 + 手动输入）
+    - 优先使用 Word 自动编号；不可用时回退纯文本编号
+    - 支持“只重新编号，不改格式”模式
+    - 支持导出标题清单为 Excel / 文本
+    - 另存为新 Word 文件，不修改原文档
+
 依赖：
-    pip install python-docx pywin32
+    pip install python-docx pywin32 openpyxl
 
 运行：
     python main.py
@@ -10,7 +21,6 @@ Word 标题识别、格式统一与自动编号工具
 
 import os
 import re
-import sys
 import shutil
 import tempfile
 import traceback
@@ -23,7 +33,6 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-# ---------- COM 支持 ----------
 try:
     import win32com.client as win32
     import pythoncom
@@ -31,8 +40,86 @@ try:
 except ImportError:
     HAS_COM = False
 
-
 W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+
+
+# =========================================================
+# 常量
+# =========================================================
+
+TEMPLATE_PRESETS = {
+    1: ["第{1}章", "第{1}篇", "第{1}部分", "第{1}编", "{1}.", "{1}、", "{1}"],
+    2: ["{1}.{2}", "{1}.{2}.", "第{1}节", "（{2}）", "({2})", "{2}.", "{2}、", "{2}"],
+    3: ["{1}.{2}.{3}", "{1}.{2}.{3}.", "（{3}）", "({3})", "{3}.", "{3}、", "{3}"],
+    4: ["{1}.{2}.{3}.{4}", "（{4}）", "({4})", "{4}.", "{4}、", "{4}"],
+    5: ["{1}.{2}.{3}.{4}.{5}", "{5}.", "{5}、", "{5}"],
+}
+
+TEMPLATE_DEFAULT = {1: "第{1}章", 2: "{1}.{2}", 3: "{1}.{2}.{3}", 4: "{4}", 5: "{5}"}
+
+SEP_PRESETS = ["空格", "顿号（、）", "点（.）", "冒号（:）", "短横（-）", "无", "制表符"]
+SEP_MAP = {
+    "空格": " ",
+    "顿号（、）": "、",
+    "点（.）": ".",
+    "冒号（:）": ":",
+    "短横（-）": "-",
+    "无": "",
+    "制表符": "\t",
+}
+
+TEMPLATE_HELP_TEXT = """编号模板编写原则
+============================
+
+一、占位符
+    {1}  表示第 1 级标题的当前序号
+    {2}  表示第 2 级标题的当前序号
+    {3}  表示第 3 级标题的当前序号
+    ...
+    {9}  表示第 9 级标题的当前序号
+    最大支持 9 级。
+
+二、使用规则
+    1. 每级模板中只能引用“本级”或“更高级”的占位符。
+       例如：
+         一级标题：可使用 {1}
+         二级标题：可使用 {1}.{2} 或 {2}
+         三级标题：可使用 {1}.{2}.{3}、{2}.{3} 或 {3}
+    2. 若模板中使用了超出本级的占位符（例如在二级里写 {3}），
+       该占位符会被自动清除，不显示任何内容。
+    3. 下级序号会随上级标题出现而自动重置为 1。
+
+三、常见示例
+    一级模板        生成效果
+    第{1}章         第1章、第2章、第3章 ...
+    第{1}篇         第1篇、第2篇 ...
+    {1}.            1.、2.、3. ...
+    {1}、           1、、2、、3、 ...
+    （{1}）         （1）、（2）、（3） ...
+
+    二级模板        生成效果（在第 1 章下）
+    {1}.{2}         1.1、1.2、1.3 ...
+    第{1}节         第1节、第2节 ...
+    （{2}）         （1）、（2）、（3） ...
+    {2}.            1.、2.、3. ...
+
+    三级模板        生成效果（在第 1 章、1.1 节下）
+    {1}.{2}.{3}     1.1.1、1.1.2 ...
+    （{3}）         （1）、（2）、（3） ...
+
+四、分隔符
+    编号与标题文字之间的字符。
+    常用：空格、顿号（、）、点（.）、冒号（:）、短横（-）、制表符、无。
+    也可以直接在下拉框中手动输入任意字符。
+
+五、关于中文数字
+    当前版本中 {1} 生成的是阿拉伯数字（1、2、3）。
+    如需“一、二、三”等中文编号，请在模板中直接写死，
+    或导出后在 Word 中手动调整。
+
+六、注意
+    模板下拉框可直接编辑，输入自定义模板后回车即可生效。
+"""
 
 
 # =========================================================
@@ -40,7 +127,6 @@ W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 # =========================================================
 
 def get_outline_level(paragraph):
-    """从段落 XML 获取大纲级别 (1-9)，无则返回 None"""
     pPr = paragraph._p.pPr
     if pPr is None:
         return None
@@ -60,7 +146,6 @@ def get_outline_level(paragraph):
 
 
 def get_style_level(style_name):
-    """从样式名解析标题级别，如 'Heading 1'、'标题 2'"""
     if not style_name:
         return None
     m = re.match(r'^(?:Heading|标题)\s*(\d+)', style_name.strip(), re.I)
@@ -70,32 +155,26 @@ def get_style_level(style_name):
 
 
 def detect_number_pattern(text):
-    """从文本前缀判断编号级别，返回 (级别, 前缀文本)，无则 (None, None)"""
-    # 第一章 / 第一节 / 第一篇 / 第一部分
-    m = re.match(r'^(第[一二三四五六七八九十百千万零〇\d]+[章节篇部分])\s*', text)
+    m = re.match(r'^(第[一二三四五六七八九十百千万零〇\d]+[章节篇部分编])\s*', text)
     if m:
         prefix = m.group(1)
         if '节' in prefix:
             return 2, prefix
         return 1, prefix
 
-    # 多级数字 1.1.1 / 1.1
     m = re.match(r'^(\d+(?:[\.．]\d+)+)([\.．、\s])', text)
     if m:
         num = m.group(1).replace('．', '.')
         return num.count('.') + 1, m.group(0)
 
-    # 单级数字 1. / 1、
     m = re.match(r'^(\d+)([\.．、\s])', text)
     if m:
         return 1, m.group(0)
 
-    # 一、二、
     m = re.match(r'^([一二三四五六七八九十]+)[、.．]\s*', text)
     if m:
         return 1, m.group(0)
 
-    # (1) （1）
     m = re.match(r'^[\(（]\d+[\)）]\s*', text)
     if m:
         return 3, m.group(0)
@@ -104,7 +183,6 @@ def detect_number_pattern(text):
 
 
 def load_paragraphs(docx_path):
-    """加载文档所有非空段落，返回列表"""
     doc = Document(docx_path)
     paras = []
     for i, p in enumerate(doc.paragraphs):
@@ -126,7 +204,6 @@ def load_paragraphs(docx_path):
 
 
 def detect_heading(para):
-    """识别段落是否为标题，返回 (级别, 来源)，优先级：大纲级别 > 内置样式 > 编号模式"""
     if para['outline']:
         return para['outline'], '大纲级别'
     lvl = get_style_level(para['style'])
@@ -139,9 +216,8 @@ def detect_heading(para):
 
 
 def remove_old_number(text):
-    """删除标题开头的旧编号"""
     patterns = [
-        r'^第[一二三四五六七八九十百千万零〇\d]+[章节篇部分][\s:：、.．]*',
+        r'^第[一二三四五六七八九十百千万零〇\d]+[章节篇部分编][\s:：、.．]*',
         r'^\d+(?:[\.．]\d+)+[\.．、\s:：]*',
         r'^\d+[\.．、\s:：]+',
         r'^[一二三四五六七八九十]+[、.．\s:：]+',
@@ -160,12 +236,6 @@ def remove_old_number(text):
 # =========================================================
 
 def generate_numbers(titles, templates, separators):
-    """
-    titles: 按文档顺序排列的标题列表，每项含 'level' 和 'is_title'
-    templates: {1: '第{1}章', 2: '{1}.{2}', ...}
-    separators: {1: ' ', ...}
-    返回与 titles 等长的前缀字符串列表（非标题返回 ''）
-    """
     counters = [0] * 10
     result = []
     for t in titles:
@@ -182,6 +252,7 @@ def generate_numbers(titles, templates, separators):
         s = tmpl
         for i in range(1, level + 1):
             s = s.replace('{' + str(i) + '}', str(counters[i - 1]))
+        s = re.sub(r'\{\d+\}', '', s)
         sep = separators.get(level, ' ')
         result.append(s + sep)
     return result
@@ -192,19 +263,16 @@ def generate_numbers(titles, templates, separators):
 # =========================================================
 
 def _clear_paragraph_runs(p):
-    """清空段落所有 run"""
     for r in list(p.runs):
         r._element.getparent().remove(r._element)
 
 
 def _set_paragraph_text(p, text):
-    """重写段落文字，保留段落本身"""
     _clear_paragraph_runs(p)
     p.add_run(text)
 
 
 def _apply_heading_style(p, doc, level):
-    """应用内置标题样式"""
     for name in (f"标题 {level}", f"Heading {level}"):
         try:
             p.style = doc.styles[name]
@@ -215,7 +283,6 @@ def _apply_heading_style(p, doc, level):
 
 
 def _set_style_font_cn(style, font_name):
-    """设置样式的中文字体"""
     style.font.name = font_name
     rpr = style.element.get_or_add_rPr()
     rfonts = rpr.find(qn('w:rFonts'))
@@ -226,9 +293,9 @@ def _set_style_font_cn(style, font_name):
 
 
 def _apply_format_to_styles(doc, format_settings):
-    """将格式设置应用到内置标题样式"""
+    if not format_settings:
+        return
     for level, fmt in format_settings.items():
-        applied = False
         for name in (f"标题 {level}", f"Heading {level}"):
             try:
                 st = doc.styles[name]
@@ -248,14 +315,12 @@ def _apply_format_to_styles(doc, format_settings):
                     st.paragraph_format.space_before = Pt(fmt['space_before'])
                 if fmt.get('space_after') is not None:
                     st.paragraph_format.space_after = Pt(fmt['space_after'])
-                applied = True
             except Exception:
                 traceback.print_exc()
             break
 
 
-def _clean_and_style(doc, title_list):
-    """去掉旧编号、应用标题样式"""
+def _clean_and_style(doc, title_list, apply_heading_style=True):
     for t in title_list:
         idx = t['index']
         if idx >= len(doc.paragraphs):
@@ -263,7 +328,8 @@ def _clean_and_style(doc, title_list):
         p = doc.paragraphs[idx]
         clean = remove_old_number(p.text)
         _set_paragraph_text(p, clean)
-        _apply_heading_style(p, doc, t['level'])
+        if apply_heading_style:
+            _apply_heading_style(p, doc, t['level'])
 
 
 # =========================================================
@@ -271,7 +337,6 @@ def _clean_and_style(doc, title_list):
 # =========================================================
 
 def get_word_app():
-    """获取 Word 或 WPS 的 COM 应用对象"""
     if not HAS_COM:
         return None
     try:
@@ -290,20 +355,13 @@ def get_word_app():
 
 
 def apply_auto_numbering(doc, title_list, templates, separators):
-    """
-    在 Word COM 文档中为标题应用多级自动编号
-    doc: Word COM Document
-    title_list: [{'index': 0-based 段落序号, 'level': 级别}, ...] 按文档顺序
-    返回 True 成功 / False 失败
-    """
     try:
-        list_gallery = doc.Application.ListGalleries(2)  # wdOutlineNumberGallery
+        list_gallery = doc.Application.ListGalleries(2)
         try:
             list_template = list_gallery.ListTemplates(1)
         except Exception:
             list_template = list_gallery.ListTemplates.Add()
 
-        # 配置每一级
         for lvl_num in range(1, 10):
             tmpl = templates.get(lvl_num)
             if not tmpl:
@@ -311,13 +369,19 @@ def apply_auto_numbering(doc, title_list, templates, separators):
             try:
                 level_obj = list_template.ListLevels(lvl_num)
                 w_tmpl = re.sub(r'\{(\d+)\}', lambda m: '%' + m.group(1), tmpl)
+                w_tmpl = re.sub(r'\{\d+\}', '', w_tmpl)
                 sep = separators.get(lvl_num, ' ')
-                level_obj.NumberFormat = w_tmpl + sep
-                level_obj.NumberStyle = 0       # wdListNumberStyleArabic
+                if sep == '\t':
+                    sep_str = '\t'
+                    level_obj.TrailingCharacter = 0
+                else:
+                    sep_str = sep
+                    level_obj.TrailingCharacter = 1
+                level_obj.NumberFormat = w_tmpl + sep_str
+                level_obj.NumberStyle = 0
                 level_obj.StartAt = 1
                 level_obj.NumberPosition = 0
                 level_obj.TextPosition = 0
-                level_obj.TrailingCharacter = 0 # wdTrailingTab
                 try:
                     level_obj.LinkedStyle = f"标题 {lvl_num}"
                 except Exception:
@@ -328,7 +392,6 @@ def apply_auto_numbering(doc, title_list, templates, separators):
             except Exception:
                 continue
 
-        # 逐个应用标题样式并应用列表
         for t in title_list:
             try:
                 para = doc.Paragraphs(t['index'] + 1)
@@ -342,12 +405,11 @@ def apply_auto_numbering(doc, title_list, templates, separators):
                     para.Range.ListFormat.ApplyListTemplateWithLevel(
                         ListTemplate=list_template,
                         ContinuePreviousList=True,
-                        ApplyTo=0,                # wdListApplyToWholeList
-                        DefaultListBehavior=2,    # wdWord10ListBehavior
+                        ApplyTo=0,
+                        DefaultListBehavior=2,
                         ApplyLevel=t['level']
                     )
                 except Exception:
-                    # 部分版本没有 ApplyListTemplateWithLevel
                     try:
                         para.Range.ListFormat.ApplyListTemplate(
                             ListTemplate=list_template,
@@ -366,21 +428,19 @@ def apply_auto_numbering(doc, title_list, templates, separators):
 
 
 def try_com_export(src_path, out_path, title_list, format_settings,
-                   templates, separators):
-    """尝试用 COM 自动编号导出"""
+                   templates, separators, apply_format=True):
     if not HAS_COM:
         return False
     tmp_dir = tempfile.mkdtemp(prefix='word_title_')
     tmp_path = os.path.join(tmp_dir, 'stage1.docx')
     app = None
     try:
-        # 1. 用 python-docx 预处理：去旧编号 + 应用样式 + 格式
         doc = Document(src_path)
-        _clean_and_style(doc, title_list)
-        _apply_format_to_styles(doc, format_settings)
+        _clean_and_style(doc, title_list, apply_heading_style=True)
+        if apply_format:
+            _apply_format_to_styles(doc, format_settings)
         doc.save(tmp_path)
 
-        # 2. 用 COM 打开并应用自动编号
         app = get_word_app()
         if app is None:
             return False
@@ -389,7 +449,7 @@ def try_com_export(src_path, out_path, title_list, format_settings,
             if not apply_auto_numbering(wdoc, title_list, templates, separators):
                 return False
             try:
-                wdoc.SaveAs2(os.path.abspath(out_path), FileFormat=16)  # docx
+                wdoc.SaveAs2(os.path.abspath(out_path), FileFormat=16)
             except Exception:
                 wdoc.SaveAs(os.path.abspath(out_path))
             return True
@@ -411,17 +471,25 @@ def try_com_export(src_path, out_path, title_list, format_settings,
 
 
 # =========================================================
-# 5. 纯文本回退导出
+# 5. 纯文本回退
 # =========================================================
 
 def text_only_export(src_path, out_path, all_titles, title_list,
-                     format_settings, templates, separators):
-    """纯文本编号回退"""
+                     format_settings, templates, separators, apply_format=True):
     doc = Document(src_path)
-    _clean_and_style(doc, title_list)
-    _apply_format_to_styles(doc, format_settings)
 
-    # 生成编号（按文档顺序）
+    if apply_format:
+        _clean_and_style(doc, title_list, apply_heading_style=True)
+        _apply_format_to_styles(doc, format_settings)
+    else:
+        for t in title_list:
+            idx = t['index']
+            if idx >= len(doc.paragraphs):
+                continue
+            p = doc.paragraphs[idx]
+            clean = remove_old_number(p.text)
+            _set_paragraph_text(p, clean)
+
     all_sorted = sorted(all_titles, key=lambda x: x['index'])
     nums = generate_numbers(all_sorted, templates, separators)
 
@@ -432,7 +500,7 @@ def text_only_export(src_path, out_path, all_titles, title_list,
         if idx >= len(doc.paragraphs):
             continue
         p = doc.paragraphs[idx]
-        clean = p.text  # 已经去掉了旧编号
+        clean = p.text
         _set_paragraph_text(p, num + clean)
 
     doc.save(out_path)
@@ -443,24 +511,95 @@ def text_only_export(src_path, out_path, all_titles, title_list,
 # =========================================================
 
 def export_document(src_path, out_path, titles, format_settings,
-                    templates, separators, use_auto_number=True):
-    """
-    titles: 完整列表（含 is_title 标记），按文档顺序
-    format_settings: {level: {'font_name','font_size','bold','color_rgb','alignment','space_before','space_after'}}
-    templates: {level: '第{1}章'}
-    separators: {level: ' '}
-    """
+                    templates, separators,
+                    use_auto_number=True, apply_format=True):
     title_list = [t for t in titles if t.get('is_title') and t.get('level')]
     title_list.sort(key=lambda x: x['index'])
 
+    if not apply_format:
+        format_settings = {}
+
     if use_auto_number and HAS_COM:
-        if try_com_export(src_path, out_path, title_list,
-                          format_settings, templates, separators):
+        if try_com_export(src_path, out_path, title_list, format_settings,
+                          templates, separators, apply_format=apply_format):
             return True
-        # 自动编号失败，回退纯文本
+
     text_only_export(src_path, out_path, titles, title_list,
-                     format_settings, templates, separators)
+                     format_settings, templates, separators,
+                     apply_format=apply_format)
     return False
+
+
+# =========================================================
+# 6.5 导出标题清单（Excel / 文本）
+# =========================================================
+
+def _export_titles_excel(titles, nums, file_path):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+    except ImportError:
+        raise RuntimeError(
+            "导出 Excel 需要安装 openpyxl：\n    pip install openpyxl\n"
+            "或改用 .txt 保存。"
+        )
+
+    wb = Workbook()
+
+    # ---- Sheet1：标题清单 ----
+    ws = wb.active
+    ws.title = "标题清单"
+    headers = ["序号", "级别", "编号", "标题文字", "识别来源", "段落索引"]
+    ws.append(headers)
+    for i, (t, num) in enumerate(zip(titles, nums), 1):
+        ws.append([
+            i,
+            t.get('level'),
+            num.strip(),
+            t.get('text', ''),
+            t.get('source', ''),
+            t.get('index'),
+        ])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal='center')
+    for col, w in zip("ABCDEF", [6, 6, 18, 60, 12, 10]):
+        ws.column_dimensions[col].width = w
+
+    # ---- Sheet2：横向排列 ----
+    ws2 = wb.create_sheet("横向排列")
+    ws2.append(["级别"] + [str(i + 1) for i in range(len(titles))])
+    ws2.append(["编号"] + [num.strip() for num in nums])
+    ws2.append(["标题文字"] + [t.get('text', '') for t in titles])
+    for c in ws2["A"]:
+        c.font = Font(bold=True)
+    ws2.column_dimensions["A"].width = 12
+
+    wb.save(file_path)
+
+
+def _export_titles_text(titles, nums, file_path):
+    lines = ["序号\t级别\t编号\t标题文字\t识别来源"]
+    for i, (t, num) in enumerate(zip(titles, nums), 1):
+        lines.append("\t".join([
+            str(i),
+            str(t.get('level', '')),
+            num.strip(),
+            t.get('text', ''),
+            t.get('source', ''),
+        ]))
+    with open(file_path, 'w', encoding='utf-8-sig') as f:
+        f.write("\n".join(lines))
+
+
+def export_titles_list(titles, file_path, templates, separators):
+    sorted_titles = sorted(titles, key=lambda x: x['index'])
+    nums = generate_numbers(sorted_titles, templates, separators)
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ('.xlsx', '.xls'):
+        _export_titles_excel(sorted_titles, nums, file_path)
+    else:
+        _export_titles_text(sorted_titles, nums, file_path)
 
 
 # =========================================================
@@ -476,8 +615,20 @@ ALIGN_MAP = {
 ALIGN_NAMES = list(ALIGN_MAP.keys())
 
 
+def show_template_help(parent):
+    win = tk.Toplevel(parent)
+    win.title("编号模板编写原则")
+    win.geometry("660x640")
+    txt = tk.Text(win, wrap='word', font=('Consolas', 10))
+    txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    txt.insert('1.0', TEMPLATE_HELP_TEXT)
+    txt.config(state='disabled')
+    ttk.Button(win, text="知道了", command=win.destroy).pack(pady=(0, 10))
+    win.transient(parent)
+    win.grab_set()
+
+
 class LevelFormatPanel:
-    """单个级别格式设置面板"""
     def __init__(self, parent, level, defaults):
         self.level = level
         self.frame = ttk.LabelFrame(parent, text=f"{level} 级标题格式")
@@ -538,14 +689,26 @@ class LevelFormatPanel:
             'space_after': int(self.after_var.get()),
         }
 
+    def set_enabled(self, enabled):
+        state = 'normal' if enabled else 'disabled'
+        for w in self.frame.winfo_children():
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+            for sub in w.winfo_children():
+                try:
+                    sub.configure(state=state)
+                except Exception:
+                    pass
+
 
 class AddParagraphDialog:
-    """从所有段落中选择段落标记为标题"""
     def __init__(self, parent, all_paras, existing_indexes):
         self.top = tk.Toplevel(parent)
         self.top.title("从所有段落中添加标题")
         self.top.geometry("820x520")
-        self.result = []          # 返回选中的段落列表
+        self.result = []
         self.all_paras = all_paras
         self.existing = set(existing_indexes)
 
@@ -563,7 +726,7 @@ class AddParagraphDialog:
         self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         self.tree.bind('<Button-1>', self.on_click)
 
-        self.check_state = {}   # iid -> bool
+        self.check_state = {}
         for p in all_paras:
             iid = str(p['index'])
             mark = '✓' if p['index'] in self.existing else ''
@@ -605,21 +768,19 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Word 标题识别、格式统一与自动编号工具")
-        self.root.geometry("1060x780")
+        self.root.geometry("1120x880")
 
         self.src_path = None
-        self.all_paras = []      # 加载文档后的所有段落
-        self.items = []          # 当前标题列表（可增删、改级别）
+        self.all_paras = []
+        self.items = []
 
         self.format_panels = {}
-        self.template_vars = {}  # {level: StringVar}
-        self.sep_vars = {}       # {level: StringVar}
+        self.template_vars = {}
+        self.sep_vars = {}
 
         self._build_ui()
 
-    # ---------- UI ----------
     def _build_ui(self):
-        # 顶部
         top = ttk.Frame(self.root)
         top.pack(fill=tk.X, padx=8, pady=6)
 
@@ -631,12 +792,11 @@ class App:
         ttk.Button(top, text="从所有段落添加", command=self.open_add_dialog).pack(side=tk.LEFT, padx=4)
         ttk.Button(top, text="移除选中", command=self.remove_selected).pack(side=tk.LEFT, padx=4)
 
-        # 中部：标题列表
-        mid = ttk.LabelFrame(self.root, text="标题列表（点击第一列勾选/取消；双击“级别”列可修改）")
+        mid = ttk.LabelFrame(self.root, text="标题列表（点击第一列勾选/取消；双击“级别”或“标题文字”列可修改）")
         mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         cols = ("包含", "序号", "级别", "标题文字", "来源", "段落索引")
-        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=14)
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=12)
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.column("包含", width=50, anchor='center')
@@ -653,7 +813,19 @@ class App:
         self.tree.bind('<Button-1>', self.on_tree_click)
         self.tree.bind('<Double-1>', self.on_tree_double)
 
-        # 格式 + 编号 面板
+        # 处理模式
+        mode_wrap = ttk.LabelFrame(self.root, text="处理模式")
+        mode_wrap.pack(fill=tk.X, padx=8, pady=4)
+
+        self.mode_var = tk.StringVar(value='reformat')
+        ttk.Radiobutton(mode_wrap, text="重新编号 + 修改标题格式",
+                        variable=self.mode_var, value='reformat',
+                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=4)
+        ttk.Radiobutton(mode_wrap, text="只重新编号（保持原标题格式）",
+                        variable=self.mode_var, value='renumber_only',
+                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=4)
+
+        # 格式 + 编号面板
         paned = ttk.Frame(self.root)
         paned.pack(fill=tk.X, padx=8, pady=4)
 
@@ -662,7 +834,6 @@ class App:
         right = ttk.Frame(paned)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
-        # 格式
         fmt_wrap = ttk.LabelFrame(left, text="按级别统一设置格式")
         fmt_wrap.pack(fill=tk.BOTH, expand=True)
         default_fonts = {1: ('黑体', 16, True), 2: ('楷体', 14, True), 3: ('宋体', 12, False)}
@@ -675,37 +846,65 @@ class App:
                 'space_after': 6 if lvl == 1 else 3,
             })
 
-        # 编号模板
-        num_wrap = ttk.LabelFrame(right, text="编号模板与分隔符（占位符 {1},{2},{3} 表示各级序号）")
+        # 编号模板与分隔符
+        num_wrap = ttk.LabelFrame(
+            right,
+            text="编号模板与分隔符（下拉选择预设，或直接手动输入；{1},{2},{3}… 为各级序号占位符）"
+        )
         num_wrap.pack(fill=tk.BOTH, expand=True)
-        defaults = {
-            1: ("第{1}章", " "),
-            2: ("{1}.{2}", " "),
-            3: ("{1}.{2}.{3}", " "),
-        }
+
+        header = ttk.Frame(num_wrap)
+        header.pack(fill=tk.X, padx=6, pady=(6, 2))
+        ttk.Label(header, text="级别", width=8).pack(side=tk.LEFT)
+        ttk.Label(header, text="编号模板").pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(header, text="分隔符").pack(side=tk.LEFT, padx=(60, 0))
+        ttk.Button(header, text="📖 模板编写原则",
+                   command=lambda: show_template_help(self.root)).pack(side=tk.RIGHT, padx=6)
+
         for lvl in (1, 2, 3):
             row = ttk.Frame(num_wrap)
-            row.pack(fill=tk.X, padx=4, pady=4)
-            ttk.Label(row, text=f"{lvl} 级模板").pack(side=tk.LEFT)
-            tv = tk.StringVar(value=defaults[lvl][0])
-            ttk.Entry(row, textvariable=tv, width=22).pack(side=tk.LEFT, padx=(4, 10))
-            ttk.Label(row, text="分隔符").pack(side=tk.LEFT)
-            sv = tk.StringVar(value=defaults[lvl][1])
-            ttk.Entry(row, textvariable=sv, width=6).pack(side=tk.LEFT, padx=4)
+            row.pack(fill=tk.X, padx=6, pady=4)
+            ttk.Label(row, text=f"{lvl} 级", width=8).pack(side=tk.LEFT)
+
+            tv = tk.StringVar(value=TEMPLATE_DEFAULT[lvl])
+            tmpl_cb = ttk.Combobox(row, textvariable=tv,
+                                   values=TEMPLATE_PRESETS.get(lvl, []),
+                                   width=24)
+            tmpl_cb.pack(side=tk.LEFT, padx=(4, 20))
             self.template_vars[lvl] = tv
+
+            ttk.Label(row, text="分隔符").pack(side=tk.LEFT)
+            sv = tk.StringVar(value="空格")
+            sep_cb = ttk.Combobox(row, textvariable=sv,
+                                  values=SEP_PRESETS, width=10)
+            sep_cb.pack(side=tk.LEFT, padx=4)
             self.sep_vars[lvl] = sv
+
+        hint = ttk.Label(
+            num_wrap,
+            text="提示：下拉框可直接编辑。如 {1}.{2} 表示“一级.二级”序号，例：1.1、1.2、2.1。",
+            foreground='#666'
+        )
+        hint.pack(anchor='w', padx=8, pady=(2, 4))
 
         self.auto_number_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(num_wrap,
                         text="优先使用 Word 自动编号（失败自动回退为纯文本编号）",
-                        variable=self.auto_number_var).pack(anchor='w', padx=6, pady=6)
+                        variable=self.auto_number_var).pack(anchor='w', padx=6, pady=(0, 6))
 
-        # 底部按钮
         bottom = ttk.Frame(self.root)
         bottom.pack(fill=tk.X, padx=8, pady=8)
         ttk.Button(bottom, text="退出", command=self.root.quit).pack(side=tk.RIGHT, padx=4)
         ttk.Button(bottom, text="导出为新 Word 文件",
                    command=self.export).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bottom, text="导出标题清单（Excel/文本）",
+                   command=self.export_titles).pack(side=tk.RIGHT, padx=4)
+
+    # ---------- 模式切换 ----------
+    def on_mode_change(self):
+        enabled = (self.mode_var.get() == 'reformat')
+        for panel in self.format_panels.values():
+            panel.set_enabled(enabled)
 
     # ---------- 事件 ----------
     def select_file(self):
@@ -716,7 +915,6 @@ class App:
         if path:
             self.src_path = path
             self.file_label.config(text=path)
-            # 重置
             self.all_paras = []
             self.items = []
             self.refresh_tree()
@@ -745,14 +943,12 @@ class App:
                 item['source'] = ''
             self.items.append(item)
 
-        # 只显示识别为标题的 + 用户已添加的
         self.refresh_tree()
         n = sum(1 for x in self.items if x['is_title'])
         messagebox.showinfo("识别完成", f"共识别到 {n} 个标题（可手动增删、调整级别）")
 
     def refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
-        # 只显示 is_title = True 的
         shown = [it for it in self.items if it['is_title']]
         shown.sort(key=lambda x: x['index'])
         for i, it in enumerate(shown):
@@ -765,11 +961,6 @@ class App:
                 it['index'],
             ))
 
-    def _visible_items(self):
-        shown = [it for it in self.items if it['is_title']]
-        shown.sort(key=lambda x: x['index'])
-        return shown
-
     def on_tree_click(self, event):
         region = self.tree.identify_region(event.x, event.y)
         if region != 'cell':
@@ -778,12 +969,9 @@ class App:
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        if col == '#1':  # 第一列“包含”
+        if col == '#1':
             vals = list(self.tree.item(iid, 'values'))
-            if vals[0] == '✓':
-                vals[0] = ''
-            else:
-                vals[0] = '✓'
+            vals[0] = '' if vals[0] == '✓' else '✓'
             self.tree.item(iid, values=vals)
 
     def on_tree_double(self, event):
@@ -794,19 +982,17 @@ class App:
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-
-        if col == '#3':  # 级别列
+        if col == '#3':
             self.edit_level(iid)
-        elif col == '#4':  # 标题文字列
+        elif col == '#4':
             self.edit_text(iid)
 
     def edit_level(self, iid):
         vals = list(self.tree.item(iid, 'values'))
-        cur = str(vals[2])
         win = tk.Toplevel(self.root)
         win.title("修改级别")
         ttk.Label(win, text="请输入 1~9 的级别：").pack(padx=10, pady=6)
-        v = tk.StringVar(value=cur)
+        v = tk.StringVar(value=str(vals[2]))
         ent = ttk.Entry(win, textvariable=v, width=8)
         ent.pack(padx=10, pady=4)
         ent.focus_set()
@@ -821,7 +1007,6 @@ class App:
                 return
             vals[2] = lv
             self.tree.item(iid, values=vals)
-            # 同步到 self.items
             idx = int(vals[5])
             for it in self.items:
                 if it['index'] == idx:
@@ -835,13 +1020,12 @@ class App:
 
     def edit_text(self, iid):
         vals = list(self.tree.item(iid, 'values'))
-        cur = str(vals[3])
         win = tk.Toplevel(self.root)
         win.title("修改标题文字")
         ttk.Label(win, text="编辑标题文字（可手动去掉旧编号）：").pack(padx=10, pady=6)
         txt = tk.Text(win, width=60, height=4)
         txt.pack(padx=10, pady=4)
-        txt.insert('1.0', cur)
+        txt.insert('1.0', str(vals[3]))
         txt.focus_set()
 
         def ok():
@@ -886,7 +1070,6 @@ class App:
                 messagebox.showerror("错误", f"读取文档失败：{e}")
                 return
 
-        # 保证 items 与 all_paras 同步
         if not self.items:
             self.items = [dict(p, is_title=False, level=None, source='') for p in self.all_paras]
 
@@ -909,7 +1092,45 @@ class App:
                 it['source'] = ''
         self.refresh_tree()
 
-    # ---------- 导出 ----------
+    # ---------- 收集界面参数 ----------
+    def _collect_templates(self):
+        result = {}
+        for lvl, var in self.template_vars.items():
+            tmpl = var.get().strip()
+            if not tmpl:
+                continue
+            result[lvl] = tmpl
+        return result
+
+    def _collect_separators(self):
+        result = {}
+        for lvl, var in self.sep_vars.items():
+            raw = var.get()
+            result[lvl] = SEP_MAP.get(raw, raw)
+        return result
+
+    def _collect_checked_titles(self):
+        """收集当前列表中勾选的标题（以表格中显示的最新值为准）"""
+        checked = []
+        for iid in self.tree.get_children():
+            vals = self.tree.item(iid, 'values')
+            if vals[0] != '✓':
+                continue
+            idx = int(vals[5])
+            for it in self.items:
+                if it['index'] == idx:
+                    item = dict(it)
+                    try:
+                        item['level'] = int(vals[2])
+                    except Exception:
+                        pass
+                    item['text'] = str(vals[3])
+                    item['is_title'] = True
+                    checked.append(item)
+                    break
+        return checked
+
+    # ---------- 导出 Word ----------
     def export(self):
         if not self.src_path:
             messagebox.showwarning("提示", "请先选择 Word 文档")
@@ -918,35 +1139,16 @@ class App:
             messagebox.showwarning("提示", "请先识别标题")
             return
 
-        # 只导出被勾选的（第一列是 ✓）
-        checked_indexes = set()
-        for iid in self.tree.get_children():
-            vals = self.tree.item(iid, 'values')
-            if vals[0] == '✓':
-                checked_indexes.add(int(vals[5]))
-        if not checked_indexes:
+        checked = self._collect_checked_titles()
+        if not checked:
             messagebox.showwarning("提示", "列表中没有任何被勾选的标题")
             return
 
-        # 应用列表中的修改（级别、文字）到 items
-        for iid in self.tree.get_children():
-            vals = self.tree.item(iid, 'values')
-            idx = int(vals[5])
-            for it in self.items:
-                if it['index'] == idx:
-                    try:
-                        it['level'] = int(vals[2])
-                    except Exception:
-                        pass
-                    it['text'] = str(vals[3])
-                    break
-
-        # 未勾选的取消 is_title
+        checked_indexes = {it['index'] for it in checked}
         for it in self.items:
             if it.get('is_title') and it['index'] not in checked_indexes:
                 it['is_title'] = False
 
-        # 输出文件
         out_path = filedialog.asksaveasfilename(
             title="另存为新文件",
             defaultextension=".docx",
@@ -955,36 +1157,80 @@ class App:
         if not out_path:
             return
 
-        # 收集格式
-        format_settings = {lvl: panel.get_settings()
-                           for lvl, panel in self.format_panels.items()}
-        templates = {lvl: v.get() for lvl, v in self.template_vars.items()}
-        separators = {lvl: v.get() for lvl, v in self.sep_vars.items()}
+        apply_format = (self.mode_var.get() == 'reformat')
+
+        if apply_format:
+            format_settings = {lvl: panel.get_settings()
+                               for lvl, panel in self.format_panels.items()}
+        else:
+            format_settings = {}
+
+        templates = self._collect_templates()
+        separators = self._collect_separators()
+
+        used_levels = {t['level'] for t in self.items
+                       if t.get('is_title') and t.get('level')}
+        missing = [lv for lv in sorted(used_levels) if lv not in templates]
+        if missing:
+            if not messagebox.askyesno(
+                    "提示",
+                    f"以下级别没有设置编号模板：{missing}\n"
+                    "未设置的级别将使用默认模板 '{级别}' 进行编号。\n是否继续？"):
+                return
 
         try:
             used_auto = export_document(
                 self.src_path, out_path, self.items, format_settings,
                 templates, separators,
-                use_auto_number=self.auto_number_var.get()
+                use_auto_number=self.auto_number_var.get(),
+                apply_format=apply_format
             )
+            mode_txt = "修改格式 + 重新编号" if apply_format else "只重新编号（保持原格式）"
             if used_auto:
-                messagebox.showinfo("完成", f"已使用 Word 自动编号导出：\n{out_path}")
+                messagebox.showinfo("完成", f"[{mode_txt}] 使用 Word 自动编号导出：\n{out_path}")
             else:
                 messagebox.showinfo("完成",
-                                    f"已使用纯文本编号导出（自动编号不可用或失败）：\n{out_path}")
+                                    f"[{mode_txt}] 使用纯文本编号导出（自动编号不可用或失败）：\n{out_path}")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"导出失败：{e}")
+
+    # ---------- 导出标题清单 ----------
+    def export_titles(self):
+        if not self.items:
+            messagebox.showwarning("提示", "请先识别标题")
+            return
+
+        checked = self._collect_checked_titles()
+        if not checked:
+            messagebox.showwarning("提示", "列表中没有任何被勾选的标题")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="导出标题清单",
+            defaultextension=".xlsx",
+            filetypes=[
+                ("Excel 文件", "*.xlsx"),
+                ("文本文件", "*.txt"),
+            ]
+        )
+        if not path:
+            return
+
+        templates = self._collect_templates()
+        separators = self._collect_separators()
+
+        try:
+            export_titles_list(checked, path, templates, separators)
+            messagebox.showinfo("完成", f"已导出标题清单：\n{path}")
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("错误", f"导出失败：{e}")
 
 
-# =========================================================
-# 8. 入口
-# =========================================================
-
 def main():
     root = tk.Tk()
     try:
-        # 稍微美化一下
         style = ttk.Style()
         style.theme_use('clam')
     except Exception:
