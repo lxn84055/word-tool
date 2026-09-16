@@ -10,6 +10,8 @@ import re
 import shutil
 import tempfile
 import traceback
+import threading
+import queue
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 
@@ -72,22 +74,9 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
         阿拉伯数字：1、2、3
         中文数字：  一、二、三
 
-    示例（一级模板 = 第{1}章）：
-        阿拉伯数字：第1章、第2章
-        中文数字：  第一章、第二章
-
 四、启用/禁用
-    编号面板每级的"启用"复选框：
-      - 勾选：该级标题会按新模板重新编号
-      - 不勾选：该级标题保留原有编号不动
-
-    格式面板每级的"启用"复选框：
-      - 勾选：该级标题会应用标题样式与格式
-      - 不勾选：该级标题的样式与格式保持不变
-
-    两个复选框互相独立：
-      例如只想改一级标题的编号，可只在编号面板勾选一级，
-      其余级别不勾选，格式面板也全部不勾选。
+    格式面板、编号面板每级都有启用复选框，可只对某一级生效。
+    两个复选框互相独立。
 
 五、常见示例
     一级：第{1}章 / 第一章
@@ -178,7 +167,6 @@ def is_toc_paragraph(paragraph):
         su = style_name.upper()
         if su.startswith('TOC') or style_name.startswith('目录'):
             return True
-
     try:
         for instr in paragraph._p.iter(qn('w:instrText')):
             t = instr.text or ''
@@ -186,11 +174,9 @@ def is_toc_paragraph(paragraph):
                 return True
     except Exception:
         pass
-
     text = paragraph.text.strip()
     if re.search(r'[\.…·]{3,}\s*\d+\s*$', text):
         return True
-
     return False
 
 
@@ -231,23 +217,18 @@ def detect_number_pattern(text):
     if m:
         prefix = m.group(1)
         return (2 if '节' in prefix else 1), prefix
-
     m = re.match(r'^(\d+(?:[\.．\-]\d+)+)([\.．、\s:：\-])', text)
     if m:
         return m.group(1).replace('．', '.').count('.') + 1, m.group(0)
-
     m = re.match(r'^(\d+)([\.．、\s:：\)）\-])', text)
     if m:
         return 1, m.group(0)
-
     m = re.match(r'^([一二三四五六七八九十]+)[、.．]\s*', text)
     if m:
         return 1, m.group(0)
-
     m = re.match(r'^[\(（]\d+[\)）]\s*', text)
     if m:
         return 3, m.group(0)
-
     return None, None
 
 
@@ -312,10 +293,6 @@ def remove_old_number(text):
 
 def generate_numbers(titles, templates, separators,
                      number_formats=None, enabled_levels=None):
-    """
-    enabled_levels: 启用的编号级别集合；None 表示全部启用。
-    未启用级别的标题会输出 ''（表示不生成编号，段落文字保持原样）。
-    """
     if number_formats is None:
         number_formats = {}
     counters = [0] * 10
@@ -398,7 +375,6 @@ def _remove_paragraph_numbering(p):
 
 
 def _remove_style_numbering(doc, num_levels=None):
-    """清除"标题 N"样式上定义的自动编号。num_levels=None 表示全部。"""
     for lvl in range(1, 10):
         if num_levels is not None and lvl not in num_levels:
             continue
@@ -467,7 +443,6 @@ def _apply_format_to_styles(doc, format_settings):
 
 
 def _prepare_titles_for_numbering(doc, title_list, num_levels):
-    """删除启用编号级别标题的原编号（文本 + 段落级自动编号）"""
     for t in title_list:
         lvl = t['level']
         if num_levels is not None and lvl not in num_levels:
@@ -483,7 +458,6 @@ def _prepare_titles_for_numbering(doc, title_list, num_levels):
 
 
 def _apply_heading_styles_for_titles(doc, title_list, fmt_levels):
-    """对启用格式的级别标题应用内置标题样式"""
     for t in title_list:
         lvl = t['level']
         if fmt_levels is not None and lvl not in fmt_levels:
@@ -496,11 +470,6 @@ def _apply_heading_styles_for_titles(doc, title_list, fmt_levels):
 
 
 def _clean_and_style(doc, title_list, fmt_levels, num_levels):
-    """
-    根据启用的级别处理：
-      - fmt_levels: 应用标题样式的级别集合（None 表示全部）
-      - num_levels: 删除原编号的级别集合（None 表示全部）
-    """
     _remove_style_numbering(doc, num_levels)
     _prepare_titles_for_numbering(doc, title_list, num_levels)
     _apply_heading_styles_for_titles(doc, title_list, fmt_levels)
@@ -528,24 +497,21 @@ def get_word_app():
     return None
 
 
-def _clear_existing_list_numbers(doc, title_list):
-    for t in title_list:
-        try:
-            para = doc.Paragraphs(t['index'] + 1)
-            para.Range.ListFormat.RemoveNumbers()
-        except Exception:
-            pass
-
-
 def apply_auto_numbering(doc, title_list, templates, separators,
-                         number_formats, num_levels):
-    """只对 num_levels 中的级别应用 Word 自动编号。"""
+                         number_formats, num_levels, progress_cb=None):
+    def report(p, m=None):
+        if progress_cb:
+            try:
+                progress_cb(p, m)
+            except Exception:
+                pass
+
     try:
-        list_gallery = doc.Application.ListGalleries(2)
         try:
+            list_gallery = doc.Application.ListGalleries(2)
             list_template = list_gallery.ListTemplates(1)
         except Exception:
-            list_template = list_gallery.ListTemplates.Add()
+            return False
 
         for lvl_num in range(1, 10):
             if num_levels is not None and lvl_num not in num_levels:
@@ -555,7 +521,8 @@ def apply_auto_numbering(doc, title_list, templates, separators,
                 continue
             try:
                 level_obj = list_template.ListLevels(lvl_num)
-                w_tmpl = re.sub(r'\{(\d+)\}', lambda m: '%' + m.group(1), tmpl)
+                w_tmpl = re.sub(r'\{(\d+)\}',
+                                lambda m: '%' + m.group(1), tmpl)
                 w_tmpl = re.sub(r'\{\d+\}', '', w_tmpl)
                 sep = separators.get(lvl_num, ' ')
                 if sep == '\t':
@@ -576,45 +543,79 @@ def apply_auto_numbering(doc, title_list, templates, separators,
             except Exception:
                 continue
 
-        # 只清除启用级别段落上原有的编号
+        try:
+            total_paras = doc.Paragraphs.Count
+        except Exception:
+            return False
+
         enabled_titles = [
             t for t in title_list
             if num_levels is None or t['level'] in num_levels
         ]
-        _clear_existing_list_numbers(doc, enabled_titles)
+        total = max(1, len(enabled_titles))
+        done = 0
+        applied_count = 0
+        total_enabled = len(enabled_titles)
 
-        for t in title_list:
-            if num_levels is not None and t['level'] not in num_levels:
+        for t in enabled_titles:
+            done += 1
+            com_idx = t['index'] + 1
+            if com_idx < 1 or com_idx > total_paras:
                 continue
             try:
-                para = doc.Paragraphs(t['index'] + 1)
-                # 只在格式启用的级别下应用标题样式（这里用 num 启用级别也能工作）
-                # 应用编号
+                para = doc.Paragraphs(com_idx)
+            except Exception:
+                continue
+
+            try:
+                para.Range.ListFormat.RemoveNumbers()
+            except Exception:
+                pass
+
+            ok = False
+            try:
+                para.Range.ListFormat.ApplyListTemplateWithLevel(
+                    ListTemplate=list_template,
+                    ContinuePreviousList=True,
+                    ApplyTo=0,
+                    DefaultListBehavior=2,
+                    ApplyLevel=t['level'],
+                )
+                ok = True
+            except Exception:
+                pass
+
+            if not ok:
                 try:
-                    para.Range.ListFormat.ApplyListTemplateWithLevel(
+                    para.Range.ListFormat.ApplyListTemplate(
                         ListTemplate=list_template,
                         ContinuePreviousList=True,
                         ApplyTo=0,
                         DefaultListBehavior=2,
-                        ApplyLevel=t['level']
                     )
-                except Exception:
                     try:
-                        para.Range.ListFormat.ApplyListTemplate(
-                            ListTemplate=list_template,
-                            ContinuePreviousList=True,
-                            ApplyTo=0,
-                            DefaultListBehavior=2
-                        )
-                        try:
-                            para.Range.ListFormat.ListLevelNumber = t['level']
-                        except Exception:
-                            pass
+                        para.Range.ListFormat.ListLevelNumber = t['level']
                     except Exception:
                         pass
-            except Exception:
-                continue
-        return True
+                    ok = True
+                except Exception:
+                    pass
+
+            if ok:
+                try:
+                    lt = para.Range.ListFormat.ListType
+                    if lt != 0:
+                        applied_count += 1
+                except Exception:
+                    applied_count += 1
+
+            if done % 3 == 0 or done == total:
+                report(60 + int(30 * done / total),
+                       f"应用 Word 自动编号 {done}/{total}")
+
+        if total_enabled > 0 and applied_count == 0:
+            return False
+        return applied_count > 0
     except Exception:
         traceback.print_exc()
         return False
@@ -622,26 +623,42 @@ def apply_auto_numbering(doc, title_list, templates, separators,
 
 def try_com_export(src_path, out_path, title_list, format_settings,
                    templates, separators, number_formats,
-                   fmt_levels, num_levels):
+                   fmt_levels, num_levels, progress_cb=None):
+    def report(p, m=None):
+        if progress_cb:
+            try:
+                progress_cb(p, m)
+            except Exception:
+                pass
+
     if not HAS_COM:
         return False
+
     tmp_dir = tempfile.mkdtemp(prefix='word_title_')
     tmp_path = os.path.join(tmp_dir, 'stage1.docx')
     app = None
     try:
+        report(15, "读取原文档...")
         doc = Document(src_path)
+        report(25, "清理原编号、应用标题样式...")
         _clean_and_style(doc, title_list, fmt_levels, num_levels)
         _apply_format_to_styles(doc, format_settings)
+        report(45, "保存临时文件...")
         doc.save(tmp_path)
 
+        report(55, "启动 Word/WPS...")
         app = get_word_app()
         if app is None:
             return False
+
         wdoc = app.Documents.Open(os.path.abspath(tmp_path), ReadOnly=False)
         try:
+            report(60, "开始应用 Word 自动编号...")
             if not apply_auto_numbering(wdoc, title_list, templates, separators,
-                                        number_formats, num_levels):
+                                        number_formats, num_levels,
+                                        progress_cb=progress_cb):
                 return False
+            report(92, "另存为新文件...")
             try:
                 wdoc.SaveAs2(os.path.abspath(out_path), FileFormat=16)
             except Exception:
@@ -670,16 +687,29 @@ def try_com_export(src_path, out_path, title_list, format_settings,
 
 def text_only_export_reformat(src_path, out_path, title_list,
                               format_settings, templates, separators,
-                              number_formats, fmt_levels, num_levels):
+                              number_formats, fmt_levels, num_levels,
+                              progress_cb=None):
+    def report(p, m=None):
+        if progress_cb:
+            try:
+                progress_cb(p, m)
+            except Exception:
+                pass
+
+    report(15, "读取原文档...")
     doc = Document(src_path)
+
+    report(25, "清理原编号、应用标题样式...")
     _clean_and_style(doc, title_list, fmt_levels, num_levels)
     _apply_format_to_styles(doc, format_settings)
 
+    report(40, "生成新编号...")
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
     nums = generate_numbers(sorted_titles, templates, separators,
                             number_formats, num_levels)
 
-    for t, num in zip(sorted_titles, nums):
+    total = max(1, len(sorted_titles))
+    for i, (t, num) in enumerate(zip(sorted_titles, nums), 1):
         if not num:
             continue
         idx = t['index']
@@ -689,22 +719,35 @@ def text_only_export_reformat(src_path, out_path, title_list,
         clean = remove_old_number(p.text)
         _set_paragraph_text(p, num + clean)
         _remove_paragraph_numbering(p)
+        if i % 3 == 0 or i == total:
+            report(40 + int(50 * i / total),
+                   f"写入新编号 {i}/{total}")
 
+    report(95, "保存文档...")
     doc.save(out_path)
 
 
 def text_only_export_renumber(src_path, out_path, title_list,
                               templates, separators, number_formats,
-                              num_levels):
-    """只重新编号：保留原样式与直接格式，只插入/替换编号。"""
+                              num_levels, progress_cb=None):
+    def report(p, m=None):
+        if progress_cb:
+            try:
+                progress_cb(p, m)
+            except Exception:
+                pass
+
+    report(15, "读取原文档...")
     doc = Document(src_path)
     _remove_style_numbering(doc, num_levels)
 
+    report(30, "生成新编号...")
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
     nums = generate_numbers(sorted_titles, templates, separators,
                             number_formats, num_levels)
 
-    for t, num in zip(sorted_titles, nums):
+    total = max(1, len(sorted_titles))
+    for i, (t, num) in enumerate(zip(sorted_titles, nums), 1):
         if not num:
             continue
         idx = t['index']
@@ -714,7 +757,11 @@ def text_only_export_renumber(src_path, out_path, title_list,
         clean = remove_old_number(p.text)
         _replace_paragraph_text_preserving_format(p, num + clean)
         _remove_paragraph_numbering(p)
+        if i % 3 == 0 or i == total:
+            report(30 + int(60 * i / total),
+                   f"替换编号 {i}/{total}")
 
+    report(95, "保存文档...")
     doc.save(out_path)
 
 
@@ -725,11 +772,16 @@ def text_only_export_renumber(src_path, out_path, title_list,
 def export_document(src_path, out_path, titles, format_settings,
                     templates, separators, number_formats,
                     fmt_levels, num_levels,
-                    use_auto_number=True, apply_format=True):
-    """
-    fmt_levels: 需要修改样式的级别集合（None=全部）；apply_format=False 时忽略
-    num_levels: 需要重新编号的级别集合（None=全部）
-    """
+                    use_auto_number=True, apply_format=True,
+                    progress_cb=None):
+    def report(p, m=None):
+        if progress_cb:
+            try:
+                progress_cb(p, m)
+            except Exception:
+                pass
+
+    report(3, "准备标题列表...")
     title_list = [
         t for t in titles
         if t.get('is_title') and isinstance(t.get('level'), int)
@@ -741,21 +793,28 @@ def export_document(src_path, out_path, titles, format_settings,
         raise RuntimeError("没有可导出的有效标题")
 
     if not apply_format:
-        # 只重新编号
-        text_only_export_renumber(src_path, out_path, title_list,
-                                  templates, separators, number_formats,
-                                  num_levels)
+        text_only_export_renumber(
+            src_path, out_path, title_list,
+            templates, separators, number_formats, num_levels,
+            progress_cb=progress_cb)
+        report(100, "完成")
         return False
 
     if use_auto_number and HAS_COM:
+        report(8, "尝试使用 Word 自动编号...")
         if try_com_export(src_path, out_path, title_list, format_settings,
                           templates, separators, number_formats,
-                          fmt_levels, num_levels):
+                          fmt_levels, num_levels, progress_cb=progress_cb):
+            report(100, "完成")
             return True
+        report(60, "自动编号失败，回退为纯文本编号...")
 
-    text_only_export_reformat(src_path, out_path, title_list,
-                              format_settings, templates, separators,
-                              number_formats, fmt_levels, num_levels)
+    text_only_export_reformat(
+        src_path, out_path, title_list,
+        format_settings, templates, separators,
+        number_formats, fmt_levels, num_levels,
+        progress_cb=progress_cb)
+    report(100, "完成")
     return False
 
 
@@ -844,6 +903,64 @@ def show_template_help(parent):
     win.grab_set()
 
 
+class ProgressDialog:
+    """模态进度窗口。"""
+
+    def __init__(self, parent, title="处理中..."):
+        self.top = tk.Toplevel(parent)
+        self.top.title(title)
+        self.top.transient(parent)
+        self.top.resizable(False, False)
+
+        w, h = 420, 120
+        self.top.update_idletasks()
+        try:
+            px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+            py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+        except Exception:
+            px = py = 200
+        self.top.geometry(f"{w}x{h}+{max(0, px)}+{max(0, py)}")
+
+        self.top.protocol("WM_DELETE_WINDOW", lambda: None)
+        try:
+            self.top.grab_set()
+        except Exception:
+            pass
+
+        self.msg_var = tk.StringVar(value="准备中...")
+        ttk.Label(self.top, textvariable=self.msg_var).pack(
+            padx=16, pady=(16, 6), anchor='w')
+        self.pb = ttk.Progressbar(self.top, mode='determinate',
+                                  maximum=100, length=380)
+        self.pb.pack(padx=16, pady=(0, 12))
+        self.pb['value'] = 0
+        self._closed = False
+
+    def update(self, pct, msg=None):
+        if self._closed:
+            return
+        try:
+            self.pb['value'] = max(0, min(100, int(pct)))
+            if msg:
+                self.msg_var.set(msg)
+            self.top.update_idletasks()
+        except Exception:
+            pass
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.top.grab_release()
+        except Exception:
+            pass
+        try:
+            self.top.destroy()
+        except Exception:
+            pass
+
+
 class ScrollableFrame(ttk.Frame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, **kwargs)
@@ -902,14 +1019,11 @@ class ScrollableFrame(ttk.Frame):
 
 
 class LevelFormatPanel:
-    """单级标题的格式面板，带启用复选框。"""
-
     def __init__(self, parent, level, defaults):
         self.level = level
         self.frame = ttk.LabelFrame(parent, text=f"{level} 级标题格式")
         self.frame.pack(fill=tk.X, padx=4, pady=2)
 
-        # 顶部：启用复选框
         header = ttk.Frame(self.frame)
         header.pack(fill=tk.X, padx=4, pady=(2, 0))
         self.enabled_var = tk.BooleanVar(value=True)
@@ -917,31 +1031,26 @@ class LevelFormatPanel:
                         variable=self.enabled_var,
                         command=self._on_toggle).pack(side=tk.LEFT)
 
-        # 内容区（可被禁用）
         self.body = ttk.Frame(self.frame)
         self.body.pack(fill=tk.X, padx=4, pady=2)
 
         row1 = ttk.Frame(self.body)
         row1.pack(fill=tk.X, pady=2)
-
         ttk.Label(row1, text="字体").pack(side=tk.LEFT)
         self.font_var = tk.StringVar(value=defaults.get('font_name', '宋体'))
-        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(side=tk.LEFT, padx=(2, 6))
-
+        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(
+            side=tk.LEFT, padx=(2, 6))
         ttk.Label(row1, text="字号").pack(side=tk.LEFT)
         self.size_var = tk.IntVar(value=defaults.get('font_size', 14))
         ttk.Spinbox(row1, from_=8, to=72, textvariable=self.size_var,
                     width=4).pack(side=tk.LEFT, padx=(2, 6))
-
         self.bold_var = tk.BooleanVar(value=defaults.get('bold', True))
         ttk.Checkbutton(row1, text="加粗",
                         variable=self.bold_var).pack(side=tk.LEFT, padx=(0, 6))
-
         ttk.Label(row1, text="对齐").pack(side=tk.LEFT)
         self.align_var = tk.StringVar(value=defaults.get('align', '左对齐'))
         ttk.Combobox(row1, textvariable=self.align_var, values=ALIGN_NAMES,
                      width=7, state='readonly').pack(side=tk.LEFT, padx=(2, 6))
-
         ttk.Label(row1, text="颜色").pack(side=tk.LEFT)
         self.color_rgb = defaults.get('color_rgb', (0, 0, 0))
         self.color_btn = tk.Button(row1, text="  ",
@@ -1011,7 +1120,8 @@ class AddParagraphDialog:
         self.all_paras = all_paras
         self.existing = set(existing_indexes)
 
-        ttk.Label(self.top, text="勾选要添加为标题的段落（可多选）").pack(anchor='w', padx=8, pady=6)
+        ttk.Label(self.top, text="勾选要添加为标题的段落（可多选）").pack(
+            anchor='w', padx=8, pady=6)
 
         cols = ("选择", "序号", "样式", "大纲", "内容")
         self.tree = ttk.Treeview(self.top, columns=cols, show='headings', height=16)
@@ -1095,7 +1205,7 @@ class App:
         self.template_vars = {}
         self.sep_vars = {}
         self.numfmt_vars = {}
-        self.num_enabled_vars = {}   # ★ 编号启用复选框
+        self.num_enabled_vars = {}
 
         self._build_ui()
 
@@ -1219,7 +1329,8 @@ class App:
         ttk.Label(header, text="分隔符").pack(side=tk.LEFT, padx=(28, 0))
         ttk.Label(header, text="数字格式").pack(side=tk.LEFT, padx=(14, 0))
         ttk.Button(header, text="📖 编写原则",
-                   command=lambda: show_template_help(self.root)).pack(side=tk.RIGHT, padx=4)
+                   command=lambda: show_template_help(self.root)).pack(
+            side=tk.RIGHT, padx=4)
 
         for lvl in (1, 2, 3):
             row = ttk.Frame(num_wrap)
@@ -1256,7 +1367,65 @@ class App:
         self.auto_number_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(num_wrap,
                         text="优先使用 Word 自动编号（失败自动回退纯文本）",
-                        variable=self.auto_number_var).pack(anchor='w', padx=6, pady=(0, 4))
+                        variable=self.auto_number_var).pack(
+            anchor='w', padx=6, pady=(0, 4))
+
+    # ---------- 进度封装 ----------
+    def _run_with_progress(self, work, on_done=None, title="处理中..."):
+        """在后台线程执行 work(progress_cb)；主线程刷新进度条。
+
+        work 接受一个 progress_cb(pct, msg) 参数，返回结果。
+        on_done(result) 在主线程被调用。
+        """
+        dlg = ProgressDialog(self.root, title=title)
+        q = queue.Queue()
+
+        def progress_cb(pct, msg=None):
+            q.put(('progress', pct, msg))
+
+        def worker():
+            if HAS_COM:
+                try:
+                    pythoncom.CoInitialize()
+                except Exception:
+                    pass
+            try:
+                result = work(progress_cb)
+                q.put(('done', result, None))
+            except Exception as e:
+                q.put(('error', e, None))
+            finally:
+                if HAS_COM:
+                    try:
+                        pythoncom.CoUninitialize()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        def poll():
+            try:
+                while True:
+                    kind, a, b = q.get_nowait()
+                    if kind == 'progress':
+                        dlg.update(a, b)
+                    elif kind == 'done':
+                        dlg.close()
+                        if on_done:
+                            try:
+                                on_done(a)
+                            except Exception:
+                                traceback.print_exc()
+                        return
+                    elif kind == 'error':
+                        dlg.close()
+                        messagebox.showerror("错误", f"处理失败：{a}")
+                        return
+            except queue.Empty:
+                pass
+            self.root.after(80, poll)
+
+        poll()
 
     # ---------- 勾选辅助 ----------
     def _get_all_iids(self):
@@ -1378,7 +1547,6 @@ class App:
 
     def on_mode_change(self):
         enabled = (self.mode_var.get() == 'reformat')
-        # 只控制面板的可用性，不改复选框值
         for panel in self.format_panels.values():
             if not enabled:
                 panel.set_enabled(False)
@@ -1567,7 +1735,6 @@ class App:
         return {lvl for lvl, var in self.num_enabled_vars.items() if var.get()}
 
     def _collect_format_settings(self):
-        """只返回启用级别；未启用的级别不修改样式。"""
         result = {}
         for lvl, panel in self.format_panels.items():
             if panel.is_enabled():
@@ -1647,17 +1814,19 @@ class App:
                     "未设置的级别将使用默认模板 '{级别}'。\n是否继续？"):
                 return
 
-        try:
-            used_auto = export_document(
+        fmt_str = ','.join(str(x) for x in sorted(fmt_levels)) or '无'
+        num_str = ','.join(str(x) for x in sorted(num_levels)) or '无'
+
+        def work(progress_cb):
+            return export_document(
                 self.src_path, out_path, title_list, format_settings,
                 templates, separators, number_formats,
                 fmt_levels, num_levels,
                 use_auto_number=self.auto_number_var.get(),
-                apply_format=apply_format)
+                apply_format=apply_format,
+                progress_cb=progress_cb)
 
-            fmt_str = ','.join(str(x) for x in sorted(fmt_levels)) or '无'
-            num_str = ','.join(str(x) for x in sorted(num_levels)) or '无'
-
+        def on_done(used_auto):
             if apply_format:
                 if used_auto:
                     messagebox.showinfo(
@@ -1679,9 +1848,9 @@ class App:
                     f"[只重新编号]\n"
                     f"  重新编号的级别：{num_str}\n"
                     f"  已使用纯文本编号导出：\n{out_path}")
-        except Exception as e:
-            traceback.print_exc()
-            messagebox.showerror("错误", f"导出失败：{e}")
+
+        self._run_with_progress(work, on_done=on_done,
+                                title="导出 Word 中...")
 
     def export_titles(self):
         if not self.items:
@@ -1701,7 +1870,6 @@ class App:
         templates = self._collect_templates()
         separators = self._collect_separators()
         number_formats = self._collect_number_formats()
-        # 导出清单时不限制级别，全部生成编号便于查看
         try:
             export_titles_list(title_list, path, templates, separators,
                                number_formats, None)
