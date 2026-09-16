@@ -120,11 +120,11 @@ def detect_number_pattern(text):
         prefix = m.group(1)
         return (2 if '节' in prefix else 1), prefix
 
-    m = re.match(r'^(\d+(?:[\.．]\d+)+)([\.．、\s])', text)
+    m = re.match(r'^(\d+(?:[\.．\-]\d+)+)([\.．、\s:：\-])', text)
     if m:
         return m.group(1).replace('．', '.').count('.') + 1, m.group(0)
 
-    m = re.match(r'^(\d+)([\.．、\s])', text)
+    m = re.match(r'^(\d+)([\.．、\s:：\)）\-])', text)
     if m:
         return 1, m.group(0)
 
@@ -170,14 +170,25 @@ def detect_heading(para):
     return None, None
 
 
+# ★ 扩展：覆盖更多编号格式
 def remove_old_number(text):
     patterns = [
-        r'^第[一二三四五六七八九十百千万零〇\d]+[章节篇部分编][\s:：、.．]*',
-        r'^\d+(?:[\.．]\d+)+[\.．、\s:：]*',
-        r'^\d+[\.．、\s:：]+',
+        # 中文编号：第X章 / 第X节 / 第X篇 / 第X部分 / 第X编
+        r'^第[一二三四五六七八九十百千万零〇\d]+[章节篇部分编][\s:：、.．\-]*',
+        # 多级数字：1.1 / 1.1.1 / 1-1-1 / 1.1-2
+        r'^\d+(?:[\.．\-]\d+)+[\.．、\s:：\-]*',
+        # 括号数字：(1) / （1） / 【1】
+        r'^[\(（\[\【]\d+[\)）\]\】][\s.．、:：\-]*',
+        # 单级数字 + 分隔符：1. / 1、 / 1) / 1- / 1:
+        r'^\d+[\.．、\s:：\)）\-]+\s*',
+        # 纯数字后接空格：1 标题
+        r'^\d+\s+',
+        # 中文数字：一、二、三、
         r'^[一二三四五六七八九十]+[、.．\s:：]+',
-        r'^[\(（]\d+[\)）][\s.．、:：]*',
+        # 圈号：① ② ③ ...
         r'^[①-⑳]\s*',
+        # 罗马数字：I. II. III. / i. ii.
+        r'^(?=[IVXLCivxlc]+[\.\s])[IVXLCivxlc]+[\.\s]+',
     ]
     for pat in patterns:
         new_text = re.sub(pat, '', text, count=1)
@@ -252,6 +263,40 @@ def _replace_paragraph_text_preserving_format(p, new_text):
             r._element.getparent().remove(r._element)
 
 
+# ★ 新增：清除段落级自动编号（w:numPr）
+def _remove_paragraph_numbering(p):
+    """移除段落上的 w:numPr，用于清除 Word 自动编号"""
+    pPr = p._p.pPr
+    if pPr is None:
+        return
+    numPr = pPr.find(qn('w:numPr'))
+    if numPr is not None:
+        pPr.remove(numPr)
+
+
+# ★ 新增：清除内置标题样式上定义的自动编号
+def _remove_style_numbering(doc):
+    """
+    移除"标题 1"~"标题 9" / "Heading 1"~"Heading 9" 样式上定义的
+    w:numPr，避免样式关联的自动编号在段落上继续显示。
+    """
+    for lvl in range(1, 10):
+        for name in (f"标题 {lvl}", f"Heading {lvl}"):
+            try:
+                st = doc.styles[name]
+            except KeyError:
+                continue
+            el = st.element
+            if el is None:
+                continue
+            pPr = el.find(qn('w:pPr'))
+            if pPr is None:
+                continue
+            numPr = pPr.find(qn('w:numPr'))
+            if numPr is not None:
+                pPr.remove(numPr)
+
+
 def _apply_heading_style(p, doc, level):
     for name in (f"标题 {level}", f"Heading {level}"):
         try:
@@ -300,20 +345,28 @@ def _apply_format_to_styles(doc, format_settings):
             break
 
 
+# ★ 修改：_clean_and_style 增加清除自动编号
 def _clean_and_style(doc, title_list, apply_heading_style=True):
+    # 先清除所有标题样式上定义的自动编号
+    _remove_style_numbering(doc)
+
     for t in title_list:
         idx = t['index']
         if idx >= len(doc.paragraphs):
             continue
         p = doc.paragraphs[idx]
+        # 删除纯文本编号
         clean = remove_old_number(p.text)
         _set_paragraph_text(p, clean)
+        # ★ 清除段落级自动编号
+        _remove_paragraph_numbering(p)
+        # 应用标题样式
         if apply_heading_style:
             _apply_heading_style(p, doc, t['level'])
 
 
 # =========================================================
-# COM 自动编号（★ 已移除 LinkedStyle）
+# COM 自动编号
 # =========================================================
 
 def get_word_app():
@@ -335,10 +388,6 @@ def get_word_app():
 
 
 def _clear_existing_list_numbers(doc, title_list):
-    """
-    ★ 新增：在应用新编号前，先清除这些段落上可能已有的列表编号。
-    避免原文档自带的编号导致叠加。
-    """
     for t in title_list:
         try:
             para = doc.Paragraphs(t['index'] + 1)
@@ -348,20 +397,13 @@ def _clear_existing_list_numbers(doc, title_list):
 
 
 def apply_auto_numbering(doc, title_list, templates, separators):
-    """
-    ★ 关键修复：
-      1. 不再设置 level_obj.LinkedStyle，避免所有"标题 N"样式段落被自动编号
-      2. 只对 title_list 中的段落调用 ApplyListTemplateWithLevel
-      3. 传入明确的 ApplyLevel，确保编号级别与识别级别一致
-    """
     try:
-        list_gallery = doc.Application.ListGalleries(2)  # 大纲编号库
+        list_gallery = doc.Application.ListGalleries(2)
         try:
             list_template = list_gallery.ListTemplates(1)
         except Exception:
             list_template = list_gallery.ListTemplates.Add()
 
-        # 配置每一级格式（不绑定样式）
         for lvl_num in range(1, 10):
             tmpl = templates.get(lvl_num)
             if not tmpl:
@@ -378,35 +420,30 @@ def apply_auto_numbering(doc, title_list, templates, separators):
                     sep_str = sep
                     level_obj.TrailingCharacter = 1
                 level_obj.NumberFormat = w_tmpl + sep_str
-                level_obj.NumberStyle = 0     # 阿拉伯数字
+                level_obj.NumberStyle = 0
                 level_obj.StartAt = 1
                 level_obj.NumberPosition = 0
                 level_obj.TextPosition = 0
-                # ★ 不设置 LinkedStyle
             except Exception:
                 continue
 
-        # 先清除这些段落已有的编号
         _clear_existing_list_numbers(doc, title_list)
 
-        # 逐个段落应用编号
         for t in title_list:
             try:
                 para = doc.Paragraphs(t['index'] + 1)
-                # 应用标题样式（保证与格式设置一致）
                 for sname in (f"标题 {t['level']}", f"Heading {t['level']}"):
                     try:
                         para.Style = doc.Styles(sname)
                         break
                     except Exception:
                         continue
-                # 应用编号
                 try:
                     para.Range.ListFormat.ApplyListTemplateWithLevel(
                         ListTemplate=list_template,
                         ContinuePreviousList=True,
-                        ApplyTo=0,               # wdListApplyToWholeList
-                        DefaultListBehavior=2,   # wdWord10ListBehavior
+                        ApplyTo=0,
+                        DefaultListBehavior=2,
                         ApplyLevel=t['level']
                     )
                 except Exception:
@@ -493,13 +530,18 @@ def text_only_export_reformat(src_path, out_path, title_list,
         p = doc.paragraphs[idx]
         clean = remove_old_number(p.text)
         _set_paragraph_text(p, num + clean)
+        _remove_paragraph_numbering(p)
 
     doc.save(out_path)
 
 
+# ★ 修改：只重新编号也清除段落级和样式级自动编号
 def text_only_export_renumber(src_path, out_path, title_list,
                               templates, separators):
     doc = Document(src_path)
+    # ★ 清除样式上的自动编号定义
+    _remove_style_numbering(doc)
+
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
     nums = generate_numbers(sorted_titles, templates, separators)
 
@@ -511,8 +553,11 @@ def text_only_export_renumber(src_path, out_path, title_list,
         if idx >= len(doc.paragraphs):
             continue
         p = doc.paragraphs[idx]
+        # 删除纯文本编号并保留原格式
         clean = remove_old_number(p.text)
         _replace_paragraph_text_preserving_format(p, num + clean)
+        # ★ 清除段落级自动编号
+        _remove_paragraph_numbering(p)
 
     doc.save(out_path)
 
@@ -622,7 +667,7 @@ ALIGN_NAMES = list(ALIGN_MAP.keys())
 def show_template_help(parent):
     win = tk.Toplevel(parent)
     win.title("编号模板编写原则")
-    win.geometry("660x640")
+    win.geometry("620x560")
     txt = tk.Text(win, wrap='word', font=('Consolas', 10))
     txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     txt.insert('1.0', TEMPLATE_HELP_TEXT)
@@ -632,45 +677,84 @@ def show_template_help(parent):
     win.grab_set()
 
 
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.vsb = ttk.Scrollbar(self, orient='vertical',
+                                 command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+
+        self.inner_id = self.canvas.create_window(
+            (0, 0), window=self.inner, anchor='nw'
+        )
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.inner.bind('<Configure>', self._on_inner_config)
+        self.canvas.bind('<Configure>', self._on_canvas_config)
+        self.canvas.bind_all('<MouseWheel>', self._on_wheel)
+
+    def _on_inner_config(self, event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox('all'))
+
+    def _on_canvas_config(self, event):
+        self.canvas.itemconfig(self.inner_id, width=event.width)
+
+    def _on_wheel(self, event):
+        if not event.delta:
+            return
+        if abs(event.delta) >= 120:
+            step = -1 * (event.delta // 120)
+        else:
+            step = -1 if event.delta > 0 else 1
+        self.canvas.yview_scroll(step, 'units')
+
+
 class LevelFormatPanel:
     def __init__(self, parent, level, defaults):
         self.level = level
         self.frame = ttk.LabelFrame(parent, text=f"{level} 级标题格式")
-        self.frame.pack(fill=tk.X, padx=6, pady=3)
+        self.frame.pack(fill=tk.X, padx=4, pady=2)
 
         row1 = ttk.Frame(self.frame)
         row1.pack(fill=tk.X, padx=4, pady=2)
 
         ttk.Label(row1, text="字体").pack(side=tk.LEFT)
         self.font_var = tk.StringVar(value=defaults.get('font_name', '宋体'))
-        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(side=tk.LEFT, padx=(2, 6))
 
         ttk.Label(row1, text="字号").pack(side=tk.LEFT)
         self.size_var = tk.IntVar(value=defaults.get('font_size', 14))
-        ttk.Spinbox(row1, from_=8, to=72, textvariable=self.size_var, width=5).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(row1, from_=8, to=72, textvariable=self.size_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 6))
 
         self.bold_var = tk.BooleanVar(value=defaults.get('bold', True))
-        ttk.Checkbutton(row1, text="加粗", variable=self.bold_var).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Checkbutton(row1, text="加粗",
+                        variable=self.bold_var).pack(side=tk.LEFT, padx=(0, 6))
 
         ttk.Label(row1, text="对齐").pack(side=tk.LEFT)
         self.align_var = tk.StringVar(value=defaults.get('align', '左对齐'))
         ttk.Combobox(row1, textvariable=self.align_var, values=ALIGN_NAMES,
-                     width=8, state='readonly').pack(side=tk.LEFT, padx=(2, 8))
+                     width=7, state='readonly').pack(side=tk.LEFT, padx=(2, 6))
 
         ttk.Label(row1, text="颜色").pack(side=tk.LEFT)
         self.color_rgb = defaults.get('color_rgb', (0, 0, 0))
-        self.color_btn = tk.Button(row1, text="    ", bg=self._rgb_to_hex(self.color_rgb),
-                                   width=3, command=self.pick_color)
-        self.color_btn.pack(side=tk.LEFT, padx=(2, 8))
+        self.color_btn = tk.Button(row1, text="  ", bg=self._rgb_to_hex(self.color_rgb),
+                                   width=2, command=self.pick_color)
+        self.color_btn.pack(side=tk.LEFT, padx=(2, 6))
 
         row2 = ttk.Frame(self.frame)
         row2.pack(fill=tk.X, padx=4, pady=2)
         ttk.Label(row2, text="段前(磅)").pack(side=tk.LEFT)
         self.before_var = tk.IntVar(value=defaults.get('space_before', 6))
-        ttk.Spinbox(row2, from_=0, to=100, textvariable=self.before_var, width=5).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(row2, from_=0, to=100, textvariable=self.before_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 6))
         ttk.Label(row2, text="段后(磅)").pack(side=tk.LEFT)
         self.after_var = tk.IntVar(value=defaults.get('space_after', 6))
-        ttk.Spinbox(row2, from_=0, to=100, textvariable=self.after_var, width=5).pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Spinbox(row2, from_=0, to=100, textvariable=self.after_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 6))
 
     @staticmethod
     def _rgb_to_hex(rgb):
@@ -711,7 +795,7 @@ class AddParagraphDialog:
     def __init__(self, parent, all_paras, existing_indexes):
         self.top = tk.Toplevel(parent)
         self.top.title("从所有段落中添加标题")
-        self.top.geometry("820x520")
+        self.top.geometry("820x480")
         self.result = []
         self.all_paras = all_paras
         self.existing = set(existing_indexes)
@@ -719,7 +803,7 @@ class AddParagraphDialog:
         ttk.Label(self.top, text="勾选要添加为标题的段落（可多选）").pack(anchor='w', padx=8, pady=6)
 
         cols = ("选择", "序号", "样式", "大纲", "内容")
-        self.tree = ttk.Treeview(self.top, columns=cols, show='headings', height=18)
+        self.tree = ttk.Treeview(self.top, columns=cols, show='headings', height=16)
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.column("选择", width=50, anchor='center')
@@ -735,7 +819,8 @@ class AddParagraphDialog:
             iid = str(p['index'])
             mark = '✓' if p['index'] in self.existing else ''
             self.tree.insert('', tk.END, iid=iid, values=(
-                mark, p['index'] + 1, p['style'], p.get('outline') or '', p['text'][:80]
+                mark, p['index'] + 1, p['style'],
+                p.get('outline') or '', p['text'][:80]
             ))
             self.check_state[iid] = (p['index'] in self.existing)
 
@@ -770,7 +855,15 @@ class App:
     def __init__(self, root):
         self.root = root
         self.root.title("Word 标题识别、格式统一与自动编号工具")
-        self.root.geometry("1120x880")
+
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        w = min(1100, sw - 60)
+        h = min(760, sh - 90)
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.minsize(880, 480)
 
         self.src_path = None
         self.all_paras = []
@@ -784,53 +877,78 @@ class App:
 
     def _build_ui(self):
         top = ttk.Frame(self.root)
-        top.pack(fill=tk.X, padx=8, pady=6)
-        ttk.Button(top, text="选择 Word 文档", command=self.select_file).pack(side=tk.LEFT)
-        self.file_label = ttk.Label(top, text="未选择文件", foreground='#555')
-        self.file_label.pack(side=tk.LEFT, padx=10)
-        ttk.Button(top, text="识别标题", command=self.detect_titles).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="从所有段落添加", command=self.open_add_dialog).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="移除选中", command=self.remove_selected).pack(side=tk.LEFT, padx=4)
+        top.pack(fill=tk.X, padx=8, pady=(6, 2))
 
-        mid = ttk.LabelFrame(self.root, text="标题列表（点击第一列勾选/取消；双击级别或文字列可修改）")
-        mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        ttk.Button(top, text="选择 Word 文档",
+                   command=self.select_file).pack(side=tk.LEFT)
+        self.file_label = ttk.Label(top, text="未选择文件", foreground='#555')
+        self.file_label.pack(side=tk.LEFT, padx=8)
+
+        ttk.Button(top, text="识别标题",
+                   command=self.detect_titles).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="从所有段落添加",
+                   command=self.open_add_dialog).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="移除选中",
+                   command=self.remove_selected).pack(side=tk.LEFT, padx=4)
+
+        bottom = ttk.Frame(self.root)
+        bottom.pack(fill=tk.X, padx=8, pady=(2, 8), side=tk.BOTTOM)
+
+        ttk.Button(bottom, text="退出",
+                   command=self.root.quit).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bottom, text="导出为新 Word 文件",
+                   command=self.export).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(bottom, text="导出标题清单（Excel/文本）",
+                   command=self.export_titles).pack(side=tk.RIGHT, padx=4)
+
+        scroll = ScrollableFrame(self.root)
+        scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
+        body = scroll.inner
+
+        mid = ttk.LabelFrame(
+            body,
+            text="标题列表（点击第一列勾选/取消；双击级别或标题文字列可修改）"
+        )
+        mid.pack(fill=tk.X, padx=2, pady=4)
 
         cols = ("包含", "序号", "级别", "标题文字", "来源", "段落索引")
-        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=12)
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=9)
         for c in cols:
             self.tree.heading(c, text=c)
-        self.tree.column("包含", width=50, anchor='center')
-        self.tree.column("序号", width=50, anchor='center')
-        self.tree.column("级别", width=60, anchor='center')
-        self.tree.column("标题文字", width=560, anchor='w')
+        self.tree.column("包含", width=48, anchor='center')
+        self.tree.column("序号", width=48, anchor='center')
+        self.tree.column("级别", width=56, anchor='center')
+        self.tree.column("标题文字", width=520, anchor='w')
         self.tree.column("来源", width=90, anchor='center')
-        self.tree.column("段落索引", width=80, anchor='center')
-        self.tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT, padx=4, pady=4)
+        self.tree.column("段落索引", width=76, anchor='center')
+        self.tree.pack(fill=tk.X, side=tk.LEFT, padx=4, pady=4)
         sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind('<Button-1>', self.on_tree_click)
         self.tree.bind('<Double-1>', self.on_tree_double)
 
-        mode_wrap = ttk.LabelFrame(self.root, text="处理模式")
-        mode_wrap.pack(fill=tk.X, padx=8, pady=4)
+        mode_wrap = ttk.LabelFrame(body, text="处理模式")
+        mode_wrap.pack(fill=tk.X, padx=2, pady=4)
+
         self.mode_var = tk.StringVar(value='reformat')
         ttk.Radiobutton(mode_wrap, text="重新编号 + 修改标题格式",
                         variable=self.mode_var, value='reformat',
-                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=4)
+                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=2)
         ttk.Radiobutton(mode_wrap, text="只重新编号（保持原标题格式）",
                         variable=self.mode_var, value='renumber_only',
-                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=4)
+                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=2)
 
-        paned = ttk.Frame(self.root)
-        paned.pack(fill=tk.X, padx=8, pady=4)
+        paned = ttk.Frame(body)
+        paned.pack(fill=tk.X, padx=2, pady=2)
+
         left = ttk.Frame(paned)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         right = ttk.Frame(paned)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
         fmt_wrap = ttk.LabelFrame(left, text="按级别统一设置格式")
-        fmt_wrap.pack(fill=tk.BOTH, expand=True)
+        fmt_wrap.pack(fill=tk.X)
         default_fonts = {1: ('黑体', 16, True), 2: ('楷体', 14, True), 3: ('宋体', 12, False)}
         for lvl in (1, 2, 3):
             fn, fs, bd = default_fonts[lvl]
@@ -842,46 +960,42 @@ class App:
             })
 
         num_wrap = ttk.LabelFrame(
-            right, text="编号模板与分隔符（下拉选择或手动输入；{1},{2},{3}… 为各级序号占位符）")
-        num_wrap.pack(fill=tk.BOTH, expand=True)
+            right,
+            text="编号模板与分隔符（{1},{2},{3}… 为各级序号）"
+        )
+        num_wrap.pack(fill=tk.X)
 
         header = ttk.Frame(num_wrap)
-        header.pack(fill=tk.X, padx=6, pady=(6, 2))
-        ttk.Label(header, text="级别", width=8).pack(side=tk.LEFT)
-        ttk.Label(header, text="编号模板").pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(header, text="分隔符").pack(side=tk.LEFT, padx=(60, 0))
-        ttk.Button(header, text="📖 模板编写原则",
-                   command=lambda: show_template_help(self.root)).pack(side=tk.RIGHT, padx=6)
+        header.pack(fill=tk.X, padx=6, pady=(4, 2))
+        ttk.Label(header, text="级别", width=6).pack(side=tk.LEFT)
+        ttk.Label(header, text="编号模板").pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(header, text="分隔符").pack(side=tk.LEFT, padx=(48, 0))
+        ttk.Button(header, text="📖 编写原则",
+                   command=lambda: show_template_help(self.root)).pack(side=tk.RIGHT, padx=4)
 
         for lvl in (1, 2, 3):
             row = ttk.Frame(num_wrap)
-            row.pack(fill=tk.X, padx=6, pady=4)
-            ttk.Label(row, text=f"{lvl} 级", width=8).pack(side=tk.LEFT)
+            row.pack(fill=tk.X, padx=6, pady=3)
+            ttk.Label(row, text=f"{lvl} 级", width=6).pack(side=tk.LEFT)
             tv = tk.StringVar(value=TEMPLATE_DEFAULT[lvl])
-            ttk.Combobox(row, textvariable=tv, values=TEMPLATE_PRESETS.get(lvl, []),
-                         width=24).pack(side=tk.LEFT, padx=(4, 20))
+            ttk.Combobox(row, textvariable=tv,
+                         values=TEMPLATE_PRESETS.get(lvl, []),
+                         width=20).pack(side=tk.LEFT, padx=(2, 12))
             self.template_vars[lvl] = tv
             ttk.Label(row, text="分隔符").pack(side=tk.LEFT)
             sv = tk.StringVar(value="空格")
             ttk.Combobox(row, textvariable=sv, values=SEP_PRESETS,
-                         width=10).pack(side=tk.LEFT, padx=4)
+                         width=9).pack(side=tk.LEFT, padx=4)
             self.sep_vars[lvl] = sv
 
         ttk.Label(num_wrap,
-                  text="提示：下拉框可直接编辑。如 {1}.{2} 表示“一级.二级”序号，例：1.1、1.2、2.1。",
+                  text="提示：下拉框可编辑。如 {1}.{2} 表示一级.二级序号。",
                   foreground='#666').pack(anchor='w', padx=8, pady=(2, 4))
 
         self.auto_number_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(num_wrap, text="优先使用 Word 自动编号（失败自动回退为纯文本编号）",
-                        variable=self.auto_number_var).pack(anchor='w', padx=6, pady=(0, 6))
-
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill=tk.X, padx=8, pady=8)
-        ttk.Button(bottom, text="退出", command=self.root.quit).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(bottom, text="导出为新 Word 文件",
-                   command=self.export).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(bottom, text="导出标题清单（Excel/文本）",
-                   command=self.export_titles).pack(side=tk.RIGHT, padx=4)
+        ttk.Checkbutton(num_wrap,
+                        text="优先使用 Word 自动编号（失败自动回退纯文本）",
+                        variable=self.auto_number_var).pack(anchor='w', padx=6, pady=(0, 4))
 
     def on_mode_change(self):
         enabled = (self.mode_var.get() == 'reformat')
@@ -1028,7 +1142,8 @@ class App:
                 messagebox.showerror("错误", f"读取文档失败：{e}")
                 return
         if not self.items:
-            self.items = [dict(p, is_title=False, level=None, source='') for p in self.all_paras]
+            self.items = [dict(p, is_title=False, level=None, source='')
+                          for p in self.all_paras]
 
         existing = [it['index'] for it in self.items if it['is_title']]
         dlg = AddParagraphDialog(self.root, self.all_paras, existing)
@@ -1073,7 +1188,6 @@ class App:
                     raise ValueError
             except (TypeError, ValueError):
                 continue
-            # 源来源可以从 self.items 中查找
             src = ''
             for it in self.items:
                 if it['index'] == idx:
@@ -1129,9 +1243,13 @@ class App:
                 apply_format=apply_format)
             if apply_format:
                 if used_auto:
-                    messagebox.showinfo("完成", f"[修改格式 + 重新编号] 使用 Word 自动编号导出：\n{out_path}")
+                    messagebox.showinfo(
+                        "完成",
+                        f"[修改格式 + 重新编号] 使用 Word 自动编号导出：\n{out_path}")
                 else:
-                    messagebox.showinfo("完成", f"[修改格式 + 重新编号] 使用纯文本编号导出：\n{out_path}")
+                    messagebox.showinfo(
+                        "完成",
+                        f"[修改格式 + 重新编号] 使用纯文本编号导出：\n{out_path}")
             else:
                 messagebox.showinfo(
                     "完成",
