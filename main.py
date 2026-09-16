@@ -49,6 +49,18 @@ SEP_MAP = {
     "短横（-）": "-", "无": "", "制表符": "\t",
 }
 
+# 数字格式
+NUMFMT_PRESETS = ["阿拉伯数字", "中文数字"]
+NUMFMT_MAP = {
+    "阿拉伯数字": "arabic",
+    "中文数字": "chinese",
+}
+
+# Word ListLevel NumberStyle 常量
+WD_NUMSTYLE_ARABIC = 0
+WD_NUMSTYLE_SIMPCHIN1 = 37   # 一、二、三
+WD_NUMSTYLE_SIMPCHIN2 = 38   # 壹、贰、叁
+
 TEMPLATE_HELP_TEXT = """编号模板编写原则
 ============================
 
@@ -64,23 +76,113 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
     3. 下级序号会随上级标题出现而自动重置为 1。
     4. 若上级标题未出现，上级序号按 1 显示（不会出现 0.1、0.0.1）。
 
-三、常见示例
-    一级模板        生成效果
-    第{1}章         第1章、第2章 ...
-    {1}.            1.、2.、3. ...
-    二级模板        生成效果（在第 1 章下）
-    {1}.{2}         1.1、1.2 ...
-    第{1}节         第1节、第2节 ...
-    三级模板        生成效果
-    {1}.{2}.{3}     1.1.1、1.1.2 ...
+三、数字格式
+    每级可以选择"阿拉伯数字"或"中文数字"：
+        阿拉伯数字：1、2、3、10、11
+        中文数字：  一、二、三、十、十一
 
-四、分隔符
+    示例（一级模板 = 第{1}章）：
+        阿拉伯数字：第1章、第2章、第3章
+        中文数字：  第一章、第二章、第三章
+
+    示例（二级模板 = 第{1}节）：
+        阿拉伯数字：第1节、第2节
+        中文数字：  第一节、第二节
+
+    注意：中文数字只影响占位符 {n} 的显示形式；
+          "第"、"章"、"节"、"." 等模板文本需自己写在模板里。
+
+四、常见示例
+    一级模板        生成效果（阿拉伯数字 / 中文数字）
+    第{1}章         第1章 / 第一章
+    第{1}篇         第1篇 / 第一篇
+    {1}.            1. / 一.
+    （{1}）         （1） / （一）
+
+    二级模板        生成效果
+    {1}.{2}         1.1 / 一.一
+    第{1}节         第1节 / 第一节
+    （{2}）         （1） / （一）
+
+五、分隔符
     编号与标题文字之间的字符，可下拉选择或手动输入。
 
-五、注意
-    {1} 生成的是阿拉伯数字（1、2、3）。
+六、注意
     下拉框可直接编辑，输入自定义模板后回车即可生效。
 """
+
+
+# =========================================================
+# 中文数字转换
+# =========================================================
+
+_CN_DIGITS = '零一二三四五六七八九'
+
+
+def num_to_chinese(n):
+    """把正整数转为中文数字。仅处理 1~9999，超出直接返回阿拉伯数字。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n <= 0:
+        return str(n)
+    if n < 10:
+        return _CN_DIGITS[n]
+    if n < 20:
+        return '十' + (_CN_DIGITS[n - 10] if n > 10 else '')
+    if n < 100:
+        tens = n // 10
+        ones = n % 10
+        return _CN_DIGITS[tens] + '十' + (_CN_DIGITS[ones] if ones else '')
+    if n < 1000:
+        h = n // 100
+        r = n % 100
+        s = _CN_DIGITS[h] + '百'
+        if r == 0:
+            return s
+        if r < 10:
+            return s + '零' + _CN_DIGITS[r]
+        return s + num_to_chinese(r)
+    if n < 10000:
+        th = n // 1000
+        r = n % 1000
+        s = _CN_DIGITS[th] + '千'
+        if r == 0:
+            return s
+        if r < 100:
+            return s + '零' + num_to_chinese(r)
+        return s + num_to_chinese(r)
+    return str(n)
+
+
+# =========================================================
+# 文件名显示辅助
+# =========================================================
+
+MAX_FILE_DISPLAY_CHARS = 46
+
+
+def truncate_path(path, max_chars=MAX_FILE_DISPLAY_CHARS):
+    if not path:
+        return ''
+    if len(path) <= max_chars:
+        return path
+
+    sep = '\\' if '\\' in path else '/'
+    parts = re.split(r'[\\/]', path)
+    filename = parts[-1] if parts else path
+
+    prefix = "..." + sep
+    if len(prefix) + len(filename) <= max_chars:
+        return prefix + filename
+
+    keep = max_chars - 3
+    head = keep // 2
+    tail = keep - head
+    if head < 1:
+        return "..." + filename[-keep:]
+    return filename[:head] + "..." + filename[-tail:]
 
 
 # =========================================================
@@ -173,21 +275,13 @@ def detect_heading(para):
 
 def remove_old_number(text):
     patterns = [
-        # 中文编号：第X章 / 第X节 / 第X篇 / 第X部分 / 第X编
         r'^第[一二三四五六七八九十百千万零〇\d]+[章节篇部分编][\s:：、.．\-]*',
-        # 多级数字：1.1 / 1.1.1 / 1-1-1 / 1.1-2
         r'^\d+(?:[\.．\-]\d+)+[\.．、\s:：\-]*',
-        # 括号数字：(1) / （1） / 【1】
         r'^[\(（\[\【]\d+[\)）\]\】][\s.．、:：\-]*',
-        # 单级数字 + 分隔符：1. / 1、 / 1) / 1- / 1:
         r'^\d+[\.．、\s:：\)）\-]+\s*',
-        # 纯数字后接空格：1 标题
         r'^\d+\s+',
-        # 中文数字：一、二、三、
         r'^[一二三四五六七八九十]+[、.．\s:：]+',
-        # 圈号：① ② ③ ...
         r'^[①-⑳]\s*',
-        # 罗马数字：I. II. III. / i. ii.
         r'^(?=[IVXLCivxlc]+[\.\s])[IVXLCivxlc]+[\.\s]+',
     ]
     for pat in patterns:
@@ -198,15 +292,15 @@ def remove_old_number(text):
 
 
 # =========================================================
-# 编号生成（★ 父级为 0 时按 1 显示）
+# 编号生成（支持中文数字）
 # =========================================================
 
-def generate_numbers(titles, templates, separators):
-    """为标题序列生成编号前缀。
-
-    - 只有 is_title=True 且 level 有效（1~9）的项才计数并生成编号。
-    - 父级计数器为 0（即上级标题尚未出现）时，按 1 显示，避免 0.1、0.0.1。
+def generate_numbers(titles, templates, separators, number_formats=None):
     """
+    number_formats: {level: 'arabic' | 'chinese'}，缺省按 'arabic' 处理
+    """
+    if number_formats is None:
+        number_formats = {}
     counters = [0] * 10
     result = []
     for t in titles:
@@ -231,10 +325,14 @@ def generate_numbers(titles, templates, separators):
         s = tmpl
         for i in range(1, level + 1):
             cnt = counters[i - 1]
-            # ★ 父级计数器为 0（未出现过上级标题）时按 1 显示
             if cnt == 0:
                 cnt = 1
-            s = s.replace('{' + str(i) + '}', str(cnt))
+            fmt = number_formats.get(i, 'arabic')
+            if fmt == 'chinese':
+                cnt_str = num_to_chinese(cnt)
+            else:
+                cnt_str = str(cnt)
+            s = s.replace('{' + str(i) + '}', cnt_str)
         s = re.sub(r'\{\d+\}', '', s)
         result.append(s + separators.get(level, ' '))
     return result
@@ -273,7 +371,6 @@ def _replace_paragraph_text_preserving_format(p, new_text):
 
 
 def _remove_paragraph_numbering(p):
-    """移除段落上的 w:numPr，用于清除 Word 自动编号"""
     pPr = p._p.pPr
     if pPr is None:
         return
@@ -283,7 +380,6 @@ def _remove_paragraph_numbering(p):
 
 
 def _remove_style_numbering(doc):
-    """移除"标题 N"样式上定义的自动编号"""
     for lvl in range(1, 10):
         for name in (f"标题 {lvl}", f"Heading {lvl}"):
             try:
@@ -364,7 +460,7 @@ def _clean_and_style(doc, title_list, apply_heading_style=True):
 
 
 # =========================================================
-# COM 自动编号
+# COM 自动编号（支持中文数字）
 # =========================================================
 
 def get_word_app():
@@ -394,7 +490,10 @@ def _clear_existing_list_numbers(doc, title_list):
             pass
 
 
-def apply_auto_numbering(doc, title_list, templates, separators):
+def apply_auto_numbering(doc, title_list, templates, separators,
+                         number_formats=None):
+    if number_formats is None:
+        number_formats = {}
     try:
         list_gallery = doc.Application.ListGalleries(2)
         try:
@@ -418,7 +517,12 @@ def apply_auto_numbering(doc, title_list, templates, separators):
                     sep_str = sep
                     level_obj.TrailingCharacter = 1
                 level_obj.NumberFormat = w_tmpl + sep_str
-                level_obj.NumberStyle = 0
+                # ★ 按级别设置 NumberStyle
+                fmt = number_formats.get(lvl_num, 'arabic')
+                if fmt == 'chinese':
+                    level_obj.NumberStyle = WD_NUMSTYLE_SIMPCHIN1
+                else:
+                    level_obj.NumberStyle = WD_NUMSTYLE_ARABIC
                 level_obj.StartAt = 1
                 level_obj.NumberPosition = 0
                 level_obj.TextPosition = 0
@@ -467,7 +571,7 @@ def apply_auto_numbering(doc, title_list, templates, separators):
 
 
 def try_com_export(src_path, out_path, title_list, format_settings,
-                   templates, separators):
+                   templates, separators, number_formats):
     if not HAS_COM:
         return False
     tmp_dir = tempfile.mkdtemp(prefix='word_title_')
@@ -484,7 +588,8 @@ def try_com_export(src_path, out_path, title_list, format_settings,
             return False
         wdoc = app.Documents.Open(os.path.abspath(tmp_path), ReadOnly=False)
         try:
-            if not apply_auto_numbering(wdoc, title_list, templates, separators):
+            if not apply_auto_numbering(wdoc, title_list, templates, separators,
+                                        number_formats):
                 return False
             try:
                 wdoc.SaveAs2(os.path.abspath(out_path), FileFormat=16)
@@ -513,13 +618,14 @@ def try_com_export(src_path, out_path, title_list, format_settings,
 # =========================================================
 
 def text_only_export_reformat(src_path, out_path, title_list,
-                              format_settings, templates, separators):
+                              format_settings, templates, separators,
+                              number_formats):
     doc = Document(src_path)
     _clean_and_style(doc, title_list, apply_heading_style=True)
     _apply_format_to_styles(doc, format_settings)
 
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
-    nums = generate_numbers(sorted_titles, templates, separators)
+    nums = generate_numbers(sorted_titles, templates, separators, number_formats)
 
     for t, num in zip(sorted_titles, nums):
         idx = t['index']
@@ -534,12 +640,12 @@ def text_only_export_reformat(src_path, out_path, title_list,
 
 
 def text_only_export_renumber(src_path, out_path, title_list,
-                              templates, separators):
+                              templates, separators, number_formats):
     doc = Document(src_path)
     _remove_style_numbering(doc)
 
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
-    nums = generate_numbers(sorted_titles, templates, separators)
+    nums = generate_numbers(sorted_titles, templates, separators, number_formats)
 
     target_indexes = {t['index'] for t in sorted_titles}
     for t, num in zip(sorted_titles, nums):
@@ -561,7 +667,7 @@ def text_only_export_renumber(src_path, out_path, title_list,
 # =========================================================
 
 def export_document(src_path, out_path, titles, format_settings,
-                    templates, separators,
+                    templates, separators, number_formats,
                     use_auto_number=True, apply_format=True):
     title_list = [
         t for t in titles
@@ -575,16 +681,17 @@ def export_document(src_path, out_path, titles, format_settings,
 
     if not apply_format:
         text_only_export_renumber(src_path, out_path, title_list,
-                                  templates, separators)
+                                  templates, separators, number_formats)
         return False
 
     if use_auto_number and HAS_COM:
         if try_com_export(src_path, out_path, title_list, format_settings,
-                          templates, separators):
+                          templates, separators, number_formats):
             return True
 
     text_only_export_reformat(src_path, out_path, title_list,
-                              format_settings, templates, separators)
+                              format_settings, templates, separators,
+                              number_formats)
     return False
 
 
@@ -637,9 +744,9 @@ def _export_titles_text(titles, nums, file_path):
         f.write("\n".join(lines))
 
 
-def export_titles_list(titles, file_path, templates, separators):
+def export_titles_list(titles, file_path, templates, separators, number_formats):
     sorted_titles = sorted(titles, key=lambda x: x['index'])
-    nums = generate_numbers(sorted_titles, templates, separators)
+    nums = generate_numbers(sorted_titles, templates, separators, number_formats)
     ext = os.path.splitext(file_path)[1].lower()
     if ext in ('.xlsx', '.xls'):
         _export_titles_excel(sorted_titles, nums, file_path)
@@ -661,7 +768,7 @@ ALIGN_NAMES = list(ALIGN_MAP.keys())
 def show_template_help(parent):
     win = tk.Toplevel(parent)
     win.title("编号模板编写原则")
-    win.geometry("620x560")
+    win.geometry("680x600")
     txt = tk.Text(win, wrap='word', font=('Consolas', 10))
     txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     txt.insert('1.0', TEMPLATE_HELP_TEXT)
@@ -688,7 +795,33 @@ class ScrollableFrame(ttk.Frame):
 
         self.inner.bind('<Configure>', self._on_inner_config)
         self.canvas.bind('<Configure>', self._on_canvas_config)
-        self.canvas.bind_all('<MouseWheel>', self._on_wheel)
+
+        self.canvas.bind('<Enter>', self._bind_wheel)
+        self.canvas.bind('<Leave>', self._unbind_wheel)
+        self.inner.bind('<Enter>', self._bind_wheel)
+        self.inner.bind('<Leave>', self._unbind_wheel)
+        self._wheel_bound = False
+
+    def _bind_wheel(self, event=None):
+        if not self._wheel_bound:
+            self.canvas.bind_all('<MouseWheel>', self._on_wheel)
+            self._wheel_bound = True
+
+    def _unbind_wheel(self, event=None):
+        try:
+            x, y = self.canvas.winfo_pointerxy()
+            widget = self.canvas.winfo_containing(x, y)
+            if widget is not None and (
+                    widget is self.canvas or widget is self.inner
+                    or str(widget).startswith(str(self.inner))):
+                return
+        except Exception:
+            pass
+        try:
+            self.canvas.unbind_all('<MouseWheel>')
+        except Exception:
+            pass
+        self._wheel_bound = False
 
     def _on_inner_config(self, event=None):
         self.canvas.configure(scrollregion=self.canvas.bbox('all'))
@@ -807,6 +940,7 @@ class AddParagraphDialog:
         self.tree.column("内容", width=520, anchor='w')
         self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         self.tree.bind('<Button-1>', self.on_click)
+        self.tree.bind('<MouseWheel>', self._on_tree_wheel)
 
         self.check_state = {}
         for p in all_paras:
@@ -826,6 +960,16 @@ class AddParagraphDialog:
         self.top.transient(parent)
         self.top.grab_set()
         parent.wait_window(self.top)
+
+    def _on_tree_wheel(self, event):
+        if not event.delta:
+            return 'break'
+        if abs(event.delta) >= 120:
+            step = -1 * (event.delta // 120)
+        else:
+            step = -1 if event.delta > 0 else 1
+        self.tree.yview_scroll(step, 'units')
+        return 'break'
 
     def on_click(self, event):
         if self.tree.identify_region(event.x, event.y) != 'cell':
@@ -866,6 +1010,7 @@ class App:
         self.format_panels = {}
         self.template_vars = {}
         self.sep_vars = {}
+        self.numfmt_vars = {}    # ★ 数字格式
 
         self._build_ui()
 
@@ -875,8 +1020,11 @@ class App:
 
         ttk.Button(top, text="选择 Word 文档",
                    command=self.select_file).pack(side=tk.LEFT)
-        self.file_label = ttk.Label(top, text="未选择文件", foreground='#555')
-        self.file_label.pack(side=tk.LEFT, padx=8)
+        self.file_label = ttk.Label(
+            top, text="未选择文件", foreground='#555',
+            width=MAX_FILE_DISPLAY_CHARS + 2, anchor='w',
+        )
+        self.file_label.pack(side=tk.LEFT, padx=6)
 
         ttk.Button(top, text="识别标题",
                    command=self.detect_titles).pack(side=tk.LEFT, padx=4)
@@ -905,8 +1053,30 @@ class App:
         )
         mid.pack(fill=tk.X, padx=2, pady=4)
 
+        quick = ttk.Frame(mid)
+        quick.pack(fill=tk.X, padx=4, pady=(4, 2))
+
+        ttk.Label(quick, text="批量操作：").pack(side=tk.LEFT)
+        ttk.Button(quick, text="全选", width=6,
+                   command=lambda: self._set_checked(
+                       self._get_all_iids(), True)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick, text="全不选", width=6,
+                   command=lambda: self._set_checked(
+                       self._get_all_iids(), False)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick, text="反选", width=6,
+                   command=self._invert_checked).pack(side=tk.LEFT, padx=2)
+        ttk.Button(quick, text="切换选中 (空格)", width=14,
+                   command=self._toggle_selected).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(
+            quick,
+            text="Ctrl/Shift + 点击行可多选，右键查看更多操作",
+            foreground='#666',
+        ).pack(side=tk.LEFT, padx=10)
+
         cols = ("包含", "序号", "级别", "标题文字", "来源", "段落索引")
-        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=9)
+        self.tree = ttk.Treeview(mid, columns=cols, show='headings', height=9,
+                                 selectmode='extended')
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.column("包含", width=48, anchor='center')
@@ -919,8 +1089,12 @@ class App:
         sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.configure(yscrollcommand=sb.set)
+
         self.tree.bind('<Button-1>', self.on_tree_click)
         self.tree.bind('<Double-1>', self.on_tree_double)
+        self.tree.bind('<MouseWheel>', self.on_tree_wheel)
+        self.tree.bind('<space>', self._on_space_key)
+        self.tree.bind('<Button-3>', self._on_right_click)
 
         mode_wrap = ttk.LabelFrame(body, text="处理模式")
         mode_wrap.pack(fill=tk.X, padx=2, pady=4)
@@ -955,41 +1129,172 @@ class App:
 
         num_wrap = ttk.LabelFrame(
             right,
-            text="编号模板与分隔符（{1},{2},{3}… 为各级序号）"
+            text="编号模板 / 分隔符 / 数字格式（{1},{2},{3}… 为各级序号）"
         )
         num_wrap.pack(fill=tk.X)
 
         header = ttk.Frame(num_wrap)
         header.pack(fill=tk.X, padx=6, pady=(4, 2))
-        ttk.Label(header, text="级别", width=6).pack(side=tk.LEFT)
+        ttk.Label(header, text="级别", width=5).pack(side=tk.LEFT)
         ttk.Label(header, text="编号模板").pack(side=tk.LEFT, padx=(2, 0))
-        ttk.Label(header, text="分隔符").pack(side=tk.LEFT, padx=(48, 0))
+        ttk.Label(header, text="分隔符").pack(side=tk.LEFT, padx=(30, 0))
+        ttk.Label(header, text="数字格式").pack(side=tk.LEFT, padx=(20, 0))
         ttk.Button(header, text="📖 编写原则",
                    command=lambda: show_template_help(self.root)).pack(side=tk.RIGHT, padx=4)
 
         for lvl in (1, 2, 3):
             row = ttk.Frame(num_wrap)
             row.pack(fill=tk.X, padx=6, pady=3)
-            ttk.Label(row, text=f"{lvl} 级", width=6).pack(side=tk.LEFT)
+            ttk.Label(row, text=f"{lvl} 级", width=5).pack(side=tk.LEFT)
             tv = tk.StringVar(value=TEMPLATE_DEFAULT[lvl])
             ttk.Combobox(row, textvariable=tv,
                          values=TEMPLATE_PRESETS.get(lvl, []),
-                         width=20).pack(side=tk.LEFT, padx=(2, 12))
+                         width=18).pack(side=tk.LEFT, padx=(2, 8))
             self.template_vars[lvl] = tv
+
             ttk.Label(row, text="分隔符").pack(side=tk.LEFT)
             sv = tk.StringVar(value="空格")
             ttk.Combobox(row, textvariable=sv, values=SEP_PRESETS,
-                         width=9).pack(side=tk.LEFT, padx=4)
+                         width=8).pack(side=tk.LEFT, padx=2)
             self.sep_vars[lvl] = sv
 
+            ttk.Label(row, text="数字格式").pack(side=tk.LEFT, padx=(6, 0))
+            nv = tk.StringVar(value="阿拉伯数字")
+            ttk.Combobox(row, textvariable=nv, values=NUMFMT_PRESETS,
+                         width=9, state='readonly').pack(side=tk.LEFT, padx=2)
+            self.numfmt_vars[lvl] = nv
+
         ttk.Label(num_wrap,
-                  text="提示：下拉框可编辑。如 {1}.{2} 表示一级.二级序号。",
+                  text="提示：如 {1}.{2} 表示一级.二级序号；数字格式选“中文数字”则 1→一、2→二。",
                   foreground='#666').pack(anchor='w', padx=8, pady=(2, 4))
 
         self.auto_number_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(num_wrap,
                         text="优先使用 Word 自动编号（失败自动回退纯文本）",
                         variable=self.auto_number_var).pack(anchor='w', padx=6, pady=(0, 4))
+
+    # ---------- 勾选辅助方法 ----------
+    def _get_all_iids(self):
+        return list(self.tree.get_children())
+
+    def _get_selected_iids(self):
+        return list(self.tree.selection())
+
+    def _set_checked(self, iids, checked):
+        for iid in iids:
+            vals = list(self.tree.item(iid, 'values'))
+            if not vals:
+                continue
+            vals[0] = '✓' if checked else ''
+            self.tree.item(iid, values=vals)
+
+    def _invert_checked(self):
+        for iid in self._get_all_iids():
+            vals = list(self.tree.item(iid, 'values'))
+            if not vals:
+                continue
+            vals[0] = '' if vals[0] == '✓' else '✓'
+            self.tree.item(iid, values=vals)
+
+    def _toggle_selected(self):
+        iids = self._get_selected_iids()
+        if not iids:
+            return
+        all_checked = True
+        for iid in iids:
+            vals = self.tree.item(iid, 'values')
+            if not vals or vals[0] != '✓':
+                all_checked = False
+                break
+        self._set_checked(iids, not all_checked)
+
+    def _on_space_key(self, event):
+        self._toggle_selected()
+        return 'break'
+
+    def _on_right_click(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid and iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="切换选中 (Space)", command=self._toggle_selected)
+        menu.add_separator()
+        menu.add_command(label="全部勾选",
+                         command=lambda: self._set_checked(self._get_all_iids(), True))
+        menu.add_command(label="全部取消",
+                         command=lambda: self._set_checked(self._get_all_iids(), False))
+        menu.add_command(label="反选", command=self._invert_checked)
+        menu.add_separator()
+        menu.add_command(label="将选中行设为 1 级",
+                         command=lambda: self._set_level_for_selected(1))
+        menu.add_command(label="将选中行设为 2 级",
+                         command=lambda: self._set_level_for_selected(2))
+        menu.add_command(label="将选中行设为 3 级",
+                         command=lambda: self._set_level_for_selected(3))
+        menu.add_separator()
+        menu.add_command(label="从标题列表移除选中行",
+                         command=self.remove_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _set_level_for_selected(self, level):
+        for iid in self._get_selected_iids():
+            vals = list(self.tree.item(iid, 'values'))
+            if not vals:
+                continue
+            vals[2] = level
+            self.tree.item(iid, values=vals)
+
+    # ---------- 滚轮事件 ----------
+    def on_tree_wheel(self, event):
+        if not event.delta:
+            return 'break'
+        if abs(event.delta) >= 120:
+            step = -1 * (event.delta // 120)
+        else:
+            step = -1 if event.delta > 0 else 1
+        self.tree.yview_scroll(step, 'units')
+        return 'break'
+
+    # ---------- 悬浮提示 ----------
+    def _bind_tooltip(self, widget, text):
+        for seq in ('<Enter>', '<Leave>'):
+            try:
+                widget.unbind(seq)
+            except Exception:
+                pass
+
+        tip = {'win': None}
+
+        def show(_e=None):
+            if tip['win'] is not None:
+                return
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            tw = tk.Toplevel(widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            lbl = tk.Label(
+                tw, text=text, justify='left',
+                background="#ffffe1", relief='solid', borderwidth=1,
+                font=('Microsoft YaHei', 9), wraplength=520,
+            )
+            lbl.pack(ipadx=4, ipady=2)
+            tip['win'] = tw
+
+        def hide(_e=None):
+            if tip['win'] is not None:
+                try:
+                    tip['win'].destroy()
+                except Exception:
+                    pass
+                tip['win'] = None
+
+        widget.bind('<Enter>', show)
+        widget.bind('<Leave>', hide)
 
     def on_mode_change(self):
         enabled = (self.mode_var.get() == 'reformat')
@@ -1002,7 +1307,8 @@ class App:
             filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")])
         if path:
             self.src_path = path
-            self.file_label.config(text=path)
+            self.file_label.config(text=truncate_path(path))
+            self._bind_tooltip(self.file_label, path)
             self.all_paras = []
             self.items = []
             self.refresh_tree()
@@ -1114,15 +1420,18 @@ class App:
         if not sel:
             messagebox.showinfo("提示", "请先在列表中选择要移除的项")
             return
+        remove_idx = set()
         for iid in sel:
             vals = self.tree.item(iid, 'values')
-            idx = int(vals[5])
-            for it in self.items:
-                if it['index'] == idx:
-                    it['is_title'] = False
-                    it['level'] = None
-                    it['source'] = ''
-                    break
+            try:
+                remove_idx.add(int(vals[5]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        for it in self.items:
+            if it['index'] in remove_idx:
+                it['is_title'] = False
+                it['level'] = None
+                it['source'] = ''
         self.refresh_tree()
 
     def open_add_dialog(self):
@@ -1165,6 +1474,11 @@ class App:
     def _collect_separators(self):
         return {lvl: SEP_MAP.get(var.get(), var.get())
                 for lvl, var in self.sep_vars.items()}
+
+    def _collect_number_formats(self):
+        """返回 {level: 'arabic' | 'chinese'}"""
+        return {lvl: NUMFMT_MAP.get(var.get(), 'arabic')
+                for lvl, var in self.numfmt_vars.items()}
 
     def _collect_checked_titles(self):
         checked = []
@@ -1219,6 +1533,7 @@ class App:
                            if apply_format else {})
         templates = self._collect_templates()
         separators = self._collect_separators()
+        number_formats = self._collect_number_formats()
 
         used_levels = {t['level'] for t in title_list}
         missing = [lv for lv in sorted(used_levels) if lv not in templates]
@@ -1232,7 +1547,7 @@ class App:
         try:
             used_auto = export_document(
                 self.src_path, out_path, title_list, format_settings,
-                templates, separators,
+                templates, separators, number_formats,
                 use_auto_number=self.auto_number_var.get(),
                 apply_format=apply_format)
             if apply_format:
@@ -1270,8 +1585,10 @@ class App:
 
         templates = self._collect_templates()
         separators = self._collect_separators()
+        number_formats = self._collect_number_formats()
         try:
-            export_titles_list(title_list, path, templates, separators)
+            export_titles_list(title_list, path, templates, separators,
+                               number_formats)
             messagebox.showinfo("完成", f"已导出标题清单：\n{path}")
         except Exception as e:
             traceback.print_exc()
