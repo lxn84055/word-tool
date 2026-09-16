@@ -5,7 +5,7 @@ Word 标题识别、格式统一与重新编号工具
 运行：python main.py
 
 编号方案：纯文本编号，直接写入标题文字前，稳定可靠。
-处理顺序：删除旧编号 → 写入新编号 → 修改格式。
+正文格式：只应用到用户指定的"正文开始标题"与"正文结束标题"之间。
 """
 
 import os
@@ -21,7 +21,7 @@ warnings.filterwarnings("ignore")
 
 from docx import Document
 from docx.shared import Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -51,6 +51,16 @@ SEP_MAP = {
 NUMFMT_PRESETS = ["阿拉伯数字", "中文数字"]
 NUMFMT_MAP = {"阿拉伯数字": "arabic", "中文数字": "chinese"}
 
+LINE_SPACING_PRESETS = ["单倍行距", "1.5 倍行距", "2 倍行距",
+                        "固定值(磅)", "最小值(磅)"]
+LINE_SPACING_MAP = {
+    "单倍行距": "single",
+    "1.5 倍行距": "1.5",
+    "2 倍行距": "double",
+    "固定值(磅)": "exact",
+    "最小值(磅)": "atleast",
+}
+
 TEMPLATE_HELP_TEXT = """编号模板编写原则
 ============================
 
@@ -68,8 +78,11 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
         阿拉伯数字：1、2、3
         中文数字：  一、二、三、十、十一、...
 
-四、启用/禁用
-    格式面板、编号面板每级都有启用复选框，可只对某一级生效。
+四、正文范围
+    需在标题列表中指定"正文开始标题"和"正文结束标题"：
+      - 右键点击标题行 → "设为正文开始" / "设为正文结束"
+      - 正文格式只应用到这两个标题之间的非标题段落
+      - 开始标题之前、结束标题之后的段落不受影响
 
 五、常见示例
     一级：第{1}章 / 第一章
@@ -145,6 +158,31 @@ def truncate_path(path, max_chars=MAX_FILE_DISPLAY_CHARS):
     if head < 1:
         return "..." + filename[-keep:]
     return filename[:head] + "..." + filename[-tail:]
+
+
+# =========================================================
+# 段落遍历（含表格内段落）
+# =========================================================
+
+def _all_paragraph_objs(doc):
+    """返回文档中所有段落对象（含表格内段落），按文档顺序。"""
+    from docx.text.paragraph import Paragraph
+    result = []
+    for p_el in doc.element.body.iter(qn('w:p')):
+        result.append(Paragraph(p_el, doc))
+    return result
+
+
+def _is_in_table(p):
+    """判断段落是否在表格单元格内。"""
+    parent = p._p.getparent()
+    while parent is not None:
+        if parent.tag == qn('w:tc'):
+            return True
+        if parent.tag == qn('w:body'):
+            return False
+        parent = parent.getparent()
+    return False
 
 
 # =========================================================
@@ -228,13 +266,18 @@ def detect_number_pattern(text):
 def load_paragraphs(docx_path):
     doc = Document(docx_path)
     paras = []
-    for i, p in enumerate(doc.paragraphs):
+    all_paras = _all_paragraph_objs(doc)
+    for i, p in enumerate(all_paras):
         text = p.text.strip()
         if not text:
             continue
-        style_name = p.style.name if p.style else ''
+        try:
+            style_name = p.style.name if p.style else ''
+        except Exception:
+            style_name = ''
         outline = get_outline_level(p)
         is_toc = is_toc_paragraph(p)
+        in_table = _is_in_table(p)
         paras.append({
             'index': i,
             'text': text,
@@ -244,12 +287,15 @@ def load_paragraphs(docx_path):
             'level': None,
             'source': '',
             'is_toc': is_toc,
+            'in_table': in_table,
         })
     return paras
 
 
-def detect_heading(para):
+def detect_heading(para, include_table=True):
     if para.get('is_toc'):
+        return None, None
+    if not include_table and para.get('in_table'):
         return None, None
     if para['outline']:
         return para['outline'], '大纲级别'
@@ -331,7 +377,6 @@ def generate_numbers(titles, templates, separators,
 # =========================================================
 
 def _replace_paragraph_text_preserving_format(p, new_text):
-    """保留第一个非空 run 的格式，替换整段文字。"""
     runs = list(p.runs)
     if not runs:
         p.add_run(new_text)
@@ -350,7 +395,6 @@ def _replace_paragraph_text_preserving_format(p, new_text):
 
 
 def _remove_paragraph_numbering(p):
-    """删除段落级自动编号 w:numPr。"""
     pPr = p._p.pPr
     if pPr is None:
         return
@@ -360,7 +404,6 @@ def _remove_paragraph_numbering(p):
 
 
 def _remove_style_numbering(doc, num_levels=None):
-    """删除标题样式上的自动编号定义。"""
     for lvl in range(1, 10):
         if num_levels is not None and lvl not in num_levels:
             continue
@@ -429,19 +472,103 @@ def _apply_format_to_styles(doc, format_settings):
 
 
 # =========================================================
+# 正文格式应用
+# =========================================================
+
+def _apply_run_font(run, fmt):
+    if fmt.get('font_name'):
+        fn = fmt['font_name']
+        run.font.name = fn
+        rpr = run._element.get_or_add_rPr()
+        rfonts = rpr.find(qn('w:rFonts'))
+        if rfonts is None:
+            rfonts = OxmlElement('w:rFonts')
+            rpr.append(rfonts)
+        rfonts.set(qn('w:eastAsia'), fn)
+        rfonts.set(qn('w:ascii'), fn)
+        rfonts.set(qn('w:hAnsi'), fn)
+    if fmt.get('font_size'):
+        run.font.size = Pt(fmt['font_size'])
+    run.font.bold = bool(fmt.get('bold', False))
+    if fmt.get('color_rgb') is not None:
+        run.font.color.rgb = RGBColor(*fmt['color_rgb'])
+
+
+def _apply_body_format(doc, all_paras, title_indexes, body_fmt,
+                       body_range=None):
+    """
+    对指定范围内的非标题、非空段落应用正文格式。
+    body_range: (start_idx, end_idx) —— 只处理 start < i < end 的段落。
+                None 表示不限制范围（应用到全文档的非标题段落）。
+    """
+    if not body_fmt:
+        return
+    start_idx, end_idx = (body_range if body_range else (None, None))
+    for i, p in enumerate(all_paras):
+        if i in title_indexes:
+            continue
+        if not p.text.strip():
+            continue
+        # 范围过滤
+        if start_idx is not None and i <= start_idx:
+            continue
+        if end_idx is not None and i >= end_idx:
+            continue
+
+        for r in p.runs:
+            try:
+                _apply_run_font(r, body_fmt)
+            except Exception:
+                traceback.print_exc()
+
+        pf = p.paragraph_format
+        if body_fmt.get('alignment') is not None:
+            pf.alignment = body_fmt['alignment']
+
+        ls_type = body_fmt.get('line_spacing_type')
+        ls_val = body_fmt.get('line_spacing_value', 18)
+        try:
+            if ls_type == 'single':
+                pf.line_spacing = 1.0
+                pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+            elif ls_type == '1.5':
+                pf.line_spacing = 1.5
+                pf.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
+            elif ls_type == 'double':
+                pf.line_spacing = 2.0
+                pf.line_spacing_rule = WD_LINE_SPACING.DOUBLE
+            elif ls_type == 'exact':
+                pf.line_spacing = Pt(ls_val)
+                pf.line_spacing_rule = WD_LINE_SPACING.EXACTLY
+            elif ls_type == 'atleast':
+                pf.line_spacing = Pt(ls_val)
+                pf.line_spacing_rule = WD_LINE_SPACING.AT_LEAST
+        except Exception:
+            traceback.print_exc()
+
+        if body_fmt.get('space_before') is not None:
+            pf.space_before = Pt(body_fmt['space_before'])
+        if body_fmt.get('space_after') is not None:
+            pf.space_after = Pt(body_fmt['space_after'])
+
+
+# =========================================================
 # 核心导出
 # =========================================================
 
 def export_document(src_path, out_path, titles, format_settings,
                     templates, separators, number_formats,
                     fmt_levels, num_levels,
-                    apply_format=True, progress_cb=None):
+                    apply_format=True, body_format=None,
+                    body_range=None,
+                    progress_cb=None):
     """
     处理顺序：
-      1. 删除旧编号（文本 + 段落级 w:numPr + 样式级 w:numPr）
-      2. 写入新编号（纯文本，插入标题前）
-      3. 修改格式（应用标题样式 + 修改样式属性）
-      4. 另存为新文件
+      1. 删除旧编号
+      2. 写入新编号
+      3. 修改标题格式
+      4. 修改正文格式（只对 body_range 内的非标题段落）
+      5. 另存为新文件
     """
     def report(pct, msg=None):
         if progress_cb:
@@ -462,25 +589,24 @@ def export_document(src_path, out_path, titles, format_settings,
 
     report(10, "读取原文档...")
     doc = Document(src_path)
+    all_paras = _all_paragraph_objs(doc)
 
     # ---------- 1. 删除旧编号 ----------
     report(20, "删除旧编号...")
     _remove_style_numbering(doc, num_levels)
-    clean_count = 0
     for t in title_list:
         if t['level'] not in num_levels:
             continue
         idx = t['index']
-        if idx >= len(doc.paragraphs):
+        if idx >= len(all_paras):
             continue
-        p = doc.paragraphs[idx]
+        p = all_paras[idx]
         clean = remove_old_number(p.text)
         if clean != p.text:
             _replace_paragraph_text_preserving_format(p, clean)
         _remove_paragraph_numbering(p)
-        clean_count += 1
 
-    # ---------- 2. 写入新编号（纯文本） ----------
+    # ---------- 2. 写入新编号 ----------
     report(40, "生成新编号...")
     nums = generate_numbers(title_list, templates, separators,
                             number_formats, num_levels)
@@ -492,34 +618,40 @@ def export_document(src_path, out_path, titles, format_settings,
         if not num:
             continue
         idx = t['index']
-        if idx >= len(doc.paragraphs):
+        if idx >= len(all_paras):
             continue
-        p = doc.paragraphs[idx]
-        # 此时 p.text 已经去掉旧编号，直接前插新编号
+        p = all_paras[idx]
         new_text = num + p.text
         _replace_paragraph_text_preserving_format(p, new_text)
         written += 1
         if total_num and (written % 5 == 0 or written == total_num):
-            report(50 + int(20 * written / total_num),
+            report(50 + int(15 * written / total_num),
                    f"写入编号 {written}/{total_num}")
 
-    # ---------- 3. 修改格式 ----------
+    # ---------- 3. 修改标题格式 ----------
     if apply_format:
-        report(75, "应用标题样式与格式...")
+        report(70, "应用标题样式与格式...")
         for t in title_list:
             lvl = t['level']
             if lvl not in fmt_levels:
                 continue
             idx = t['index']
-            if idx >= len(doc.paragraphs):
+            if idx >= len(all_paras):
                 continue
-            p = doc.paragraphs[idx]
+            p = all_paras[idx]
             _apply_heading_style(p, doc, lvl)
 
-        report(85, "应用样式属性...")
+        report(80, "应用标题样式属性...")
         _apply_format_to_styles(doc, format_settings)
 
-    # ---------- 4. 保存 ----------
+    # ---------- 4. 修改正文格式 ----------
+    if body_format:
+        report(85, "应用正文格式...")
+        title_indexes = {t['index'] for t in title_list}
+        _apply_body_format(doc, all_paras, title_indexes, body_format,
+                           body_range=body_range)
+
+    # ---------- 5. 保存 ----------
     report(95, "保存文档...")
     doc.save(out_path)
     report(100, "完成")
@@ -600,7 +732,7 @@ ALIGN_NAMES = list(ALIGN_MAP.keys())
 def show_template_help(parent):
     win = tk.Toplevel(parent)
     win.title("编号模板编写原则")
-    win.geometry("680x620")
+    win.geometry("680x660")
     txt = tk.Text(win, wrap='word', font=('Consolas', 10))
     txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     txt.insert('1.0', TEMPLATE_HELP_TEXT)
@@ -816,6 +948,146 @@ class LevelFormatPanel:
         }
 
 
+class BodyFormatPanel:
+    """正文格式面板。"""
+
+    def __init__(self, parent):
+        self.frame = ttk.LabelFrame(
+            parent, text="正文格式（只应用到指定的正文范围内）")
+        self.frame.pack(fill=tk.X, padx=4, pady=4)
+
+        header = ttk.Frame(self.frame)
+        header.pack(fill=tk.X, padx=4, pady=(2, 0))
+        self.enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(header, text="启用正文格式修改",
+                        variable=self.enabled_var,
+                        command=self._on_toggle).pack(side=tk.LEFT)
+        ttk.Label(header,
+                  text="（需先右键标题行设置“正文开始”和“正文结束”）",
+                  foreground='#666').pack(side=tk.LEFT, padx=8)
+
+        self.body = ttk.Frame(self.frame)
+        self.body.pack(fill=tk.X, padx=4, pady=2)
+
+        row1 = ttk.Frame(self.body)
+        row1.pack(fill=tk.X, pady=2)
+        ttk.Label(row1, text="字体").pack(side=tk.LEFT)
+        self.font_var = tk.StringVar(value="宋体")
+        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(
+            side=tk.LEFT, padx=(2, 6))
+        ttk.Label(row1, text="字号").pack(side=tk.LEFT)
+        self.size_var = tk.IntVar(value=12)
+        ttk.Spinbox(row1, from_=8, to=72, textvariable=self.size_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 6))
+        self.bold_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row1, text="加粗",
+                        variable=self.bold_var).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(row1, text="对齐").pack(side=tk.LEFT)
+        self.align_var = tk.StringVar(value="两端对齐")
+        ttk.Combobox(row1, textvariable=self.align_var, values=ALIGN_NAMES,
+                     width=7, state='readonly').pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(row1, text="颜色").pack(side=tk.LEFT)
+        self.color_rgb = (0, 0, 0)
+        self.color_btn = tk.Button(row1, text="  ",
+                                   bg=self._rgb_to_hex(self.color_rgb),
+                                   width=2, command=self.pick_color)
+        self.color_btn.pack(side=tk.LEFT, padx=(2, 6))
+
+        row2 = ttk.Frame(self.body)
+        row2.pack(fill=tk.X, pady=2)
+        ttk.Label(row2, text="行间距").pack(side=tk.LEFT)
+        self.ls_var = tk.StringVar(value="单倍行距")
+        self.ls_cb = ttk.Combobox(row2, textvariable=self.ls_var,
+                                  values=LINE_SPACING_PRESETS,
+                                  width=12, state='readonly')
+        self.ls_cb.pack(side=tk.LEFT, padx=(2, 4))
+        self.ls_cb.bind('<<ComboboxSelected>>', self._on_ls_change)
+
+        ttk.Label(row2, text="数值(磅)").pack(side=tk.LEFT)
+        self.ls_val_var = tk.IntVar(value=18)
+        self.ls_val_sb = ttk.Spinbox(row2, from_=6, to=200,
+                                     textvariable=self.ls_val_var,
+                                     width=5, state='disabled')
+        self.ls_val_sb.pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Label(row2, text="段前(磅)").pack(side=tk.LEFT)
+        self.before_var = tk.IntVar(value=0)
+        ttk.Spinbox(row2, from_=0, to=100, textvariable=self.before_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Label(row2, text="段后(磅)").pack(side=tk.LEFT)
+        self.after_var = tk.IntVar(value=0)
+        ttk.Spinbox(row2, from_=0, to=100, textvariable=self.after_var,
+                    width=4).pack(side=tk.LEFT, padx=(2, 6))
+
+        self._on_toggle()
+
+    def _on_ls_change(self, event=None):
+        val = self.ls_var.get()
+        if val in ("固定值(磅)", "最小值(磅)"):
+            try:
+                self.ls_val_sb.configure(state='normal')
+            except Exception:
+                pass
+        else:
+            try:
+                self.ls_val_sb.configure(state='disabled')
+            except Exception:
+                pass
+
+    def _on_toggle(self):
+        self.set_enabled(self.enabled_var.get())
+        if self.enabled_var.get():
+            self._on_ls_change()
+
+    def set_enabled(self, enabled):
+        state = 'normal' if enabled else 'disabled'
+        for w in self.body.winfo_children():
+            try:
+                w.configure(state=state)
+            except Exception:
+                pass
+            for sub in w.winfo_children():
+                try:
+                    sub.configure(state=state)
+                except Exception:
+                    pass
+        if enabled:
+            self._on_ls_change()
+
+    def is_enabled(self):
+        return bool(self.enabled_var.get())
+
+    @staticmethod
+    def _rgb_to_hex(rgb):
+        return '#%02x%02x%02x' % rgb
+
+    def pick_color(self):
+        rgb, hx = colorchooser.askcolor(color=self._rgb_to_hex(self.color_rgb))
+        if rgb:
+            self.color_rgb = tuple(int(x) for x in rgb)
+            self.color_btn.config(bg=hx)
+
+    def get_settings(self):
+        ls_name = self.ls_var.get()
+        ls_type = LINE_SPACING_MAP.get(ls_name, 'single')
+        try:
+            ls_val = int(self.ls_val_var.get())
+        except (TypeError, ValueError):
+            ls_val = 18
+        return {
+            'font_name': self.font_var.get().strip(),
+            'font_size': int(self.size_var.get()),
+            'bold': bool(self.bold_var.get()),
+            'color_rgb': self.color_rgb,
+            'alignment': ALIGN_MAP.get(self.align_var.get(),
+                                       WD_ALIGN_PARAGRAPH.JUSTIFY),
+            'line_spacing_type': ls_type,
+            'line_spacing_value': ls_val,
+            'space_before': int(self.before_var.get()),
+            'space_after': int(self.after_var.get()),
+        }
+
+
 class AddParagraphDialog:
     def __init__(self, parent, all_paras, existing_indexes):
         self.top = tk.Toplevel(parent)
@@ -829,7 +1101,7 @@ class AddParagraphDialog:
                   text="勾选要添加为标题的段落（可多选）").pack(
             anchor='w', padx=8, pady=6)
 
-        cols = ("选择", "序号", "样式", "大纲", "内容")
+        cols = ("选择", "序号", "样式", "表格", "内容")
         self.tree = ttk.Treeview(self.top, columns=cols, show='headings',
                                  height=16)
         for c in cols:
@@ -837,7 +1109,7 @@ class AddParagraphDialog:
         self.tree.column("选择", width=50, anchor='center')
         self.tree.column("序号", width=60, anchor='center')
         self.tree.column("样式", width=110, anchor='w')
-        self.tree.column("大纲", width=60, anchor='center')
+        self.tree.column("表格", width=60, anchor='center')
         self.tree.column("内容", width=520, anchor='w')
         self.tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         self.tree.bind('<Button-1>', self.on_click)
@@ -847,9 +1119,9 @@ class AddParagraphDialog:
         for p in all_paras:
             iid = str(p['index'])
             mark = '✓' if p['index'] in self.existing else ''
+            in_tbl = '是' if p.get('in_table') else ''
             self.tree.insert('', tk.END, iid=iid, values=(
-                mark, p['index'] + 1, p['style'],
-                p.get('outline') or '', p['text'][:80]
+                mark, p['index'] + 1, p['style'], in_tbl, p['text'][:80]
             ))
             self.check_state[iid] = (p['index'] in self.existing)
 
@@ -901,7 +1173,7 @@ class App:
         sw = root.winfo_screenwidth()
         sh = root.winfo_screenheight()
         w = min(1100, sw - 60)
-        h = min(760, sh - 90)
+        h = min(820, sh - 90)
         x = max(0, (sw - w) // 2)
         y = max(0, (sh - h) // 2)
         root.geometry(f"{w}x{h}+{x}+{y}")
@@ -916,6 +1188,16 @@ class App:
         self.sep_vars = {}
         self.numfmt_vars = {}
         self.num_enabled_vars = {}
+
+        # 识别选项
+        self.include_table_var = tk.BooleanVar(value=True)
+
+        # 正文范围（标题段落索引）
+        self.body_start_idx = None
+        self.body_end_idx = None
+
+        # 正文格式面板
+        self.body_panel = None
 
         self._build_ui()
 
@@ -951,9 +1233,10 @@ class App:
         scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
         body = scroll.inner
 
+        # ---------- 标题列表 ----------
         mid = ttk.LabelFrame(
             body,
-            text="标题列表（点击第一列勾选/取消；双击级别或标题文字列可修改）")
+            text="标题列表（点击第一列勾选/取消；双击级别或文字列修改；右键设置正文范围）")
         mid.pack(fill=tk.X, padx=2, pady=4)
 
         quick = ttk.Frame(mid)
@@ -974,17 +1257,25 @@ class App:
         ttk.Label(quick, text="Ctrl/Shift + 点击行可多选",
                   foreground='#666').pack(side=tk.LEFT, padx=10)
 
-        cols = ("包含", "序号", "级别", "标题文字", "来源", "段落索引")
+        # 正文范围状态条
+        self.body_range_var = tk.StringVar(value="正文范围：未设置（右键标题行可设置）")
+        ttk.Label(quick, textvariable=self.body_range_var,
+                  foreground='#0066cc').pack(side=tk.LEFT, padx=10)
+
+        cols = ("包含", "序号", "级别", "标题文字", "来源",
+                "段索", "正文起", "正文止")
         self.tree = ttk.Treeview(mid, columns=cols, show='headings',
-                                 height=9, selectmode='extended')
+                                 height=8, selectmode='extended')
         for c in cols:
             self.tree.heading(c, text=c)
         self.tree.column("包含", width=48, anchor='center')
         self.tree.column("序号", width=48, anchor='center')
         self.tree.column("级别", width=56, anchor='center')
-        self.tree.column("标题文字", width=520, anchor='w')
-        self.tree.column("来源", width=90, anchor='center')
-        self.tree.column("段落索引", width=76, anchor='center')
+        self.tree.column("标题文字", width=440, anchor='w')
+        self.tree.column("来源", width=110, anchor='center')
+        self.tree.column("段索", width=60, anchor='center')
+        self.tree.column("正文起", width=56, anchor='center')
+        self.tree.column("正文止", width=56, anchor='center')
         self.tree.pack(fill=tk.X, side=tk.LEFT, padx=4, pady=4)
         sb = ttk.Scrollbar(mid, orient='vertical', command=self.tree.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -996,8 +1287,12 @@ class App:
         self.tree.bind('<space>', self._on_space_key)
         self.tree.bind('<Button-3>', self._on_right_click)
 
-        mode_wrap = ttk.LabelFrame(body, text="处理模式")
-        mode_wrap.pack(fill=tk.X, padx=2, pady=4)
+        # ---------- 处理模式 + 识别选项 ----------
+        opt_wrap = ttk.Frame(body)
+        opt_wrap.pack(fill=tk.X, padx=2, pady=4)
+
+        mode_wrap = ttk.LabelFrame(opt_wrap, text="处理模式")
+        mode_wrap.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
 
         self.mode_var = tk.StringVar(value='reformat')
         ttk.Radiobutton(mode_wrap, text="重新编号 + 修改标题格式",
@@ -1009,6 +1304,16 @@ class App:
                         command=self.on_mode_change).pack(
             side=tk.LEFT, padx=10, pady=2)
 
+        recog_wrap = ttk.LabelFrame(opt_wrap, text="识别选项")
+        recog_wrap.pack(side=tk.LEFT, fill=tk.X, padx=(4, 0))
+
+        ttk.Checkbutton(
+            recog_wrap,
+            text="识别表格里的标题",
+            variable=self.include_table_var).pack(
+            side=tk.LEFT, padx=10, pady=2)
+
+        # ---------- 标题格式 + 编号模板 ----------
         paned = ttk.Frame(body)
         paned.pack(fill=tk.X, padx=2, pady=2)
 
@@ -1018,7 +1323,7 @@ class App:
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
 
         fmt_wrap = ttk.LabelFrame(
-            left, text="按级别统一设置格式（每级可单独启用/禁用）")
+            left, text="按级别统一设置标题格式（每级可单独启用/禁用）")
         fmt_wrap.pack(fill=tk.X)
         default_fonts = {1: ('黑体', 16, True), 2: ('楷体', 14, True),
                          3: ('宋体', 12, False)}
@@ -1076,8 +1381,54 @@ class App:
             self.numfmt_vars[lvl] = nv
 
         ttk.Label(num_wrap,
-                  text="提示：编号为纯文本，直接写入标题前，稳定可靠。",
+                  text="提示：编号为纯文本，直接写入标题前。",
                   foreground='#666').pack(anchor='w', padx=8, pady=(2, 4))
+
+        # ---------- 正文格式 ----------
+        self.body_panel = BodyFormatPanel(body)
+
+    # ---------- 正文范围设置 ----------
+    def _update_body_range_label(self):
+        start_text = '未设置'
+        end_text = '未设置'
+        if self.body_start_idx is not None:
+            for it in self.items:
+                if it.get('index') == self.body_start_idx:
+                    start_text = f"【{it.get('text', '')[:18]}】"
+                    break
+        if self.body_end_idx is not None:
+            for it in self.items:
+                if it.get('index') == self.body_end_idx:
+                    end_text = f"【{it.get('text', '')[:18]}】"
+                    break
+        self.body_range_var.set(
+            f"正文范围：{start_text} → {end_text}")
+
+    def _set_body_start(self, iid):
+        vals = self.tree.item(iid, 'values')
+        try:
+            idx = int(vals[5])
+        except (TypeError, ValueError, IndexError):
+            return
+        self.body_start_idx = idx
+        self._update_body_range_label()
+        self.refresh_tree()
+
+    def _set_body_end(self, iid):
+        vals = self.tree.item(iid, 'values')
+        try:
+            idx = int(vals[5])
+        except (TypeError, ValueError, IndexError):
+            return
+        self.body_end_idx = idx
+        self._update_body_range_label()
+        self.refresh_tree()
+
+    def _clear_body_range(self):
+        self.body_start_idx = None
+        self.body_end_idx = None
+        self._update_body_range_label()
+        self.refresh_tree()
 
     def _run_with_progress(self, work, on_done=None, title="处理中..."):
         dlg = ProgressDialog(self.root, title=title)
@@ -1162,9 +1513,43 @@ class App:
         if iid and iid not in self.tree.selection():
             self.tree.selection_set(iid)
 
+        # 判断当前行是否已标记为起/止
+        is_start = False
+        is_end = False
+        if iid:
+            v = self.tree.item(iid, 'values')
+            try:
+                is_start = (v[6] == '起')
+                is_end = (v[7] == '止')
+            except Exception:
+                pass
+
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="切换选中 (Space)",
                          command=self._toggle_selected)
+        menu.add_separator()
+
+        if is_start:
+            menu.add_command(
+                label="取消「正文开始」标记",
+                command=self._clear_body_start)
+        else:
+            menu.add_command(
+                label="将选中行设为「正文开始」",
+                command=lambda: self._set_body_start(iid))
+
+        if is_end:
+            menu.add_command(
+                label="取消「正文结束」标记",
+                command=self._clear_body_end)
+        else:
+            menu.add_command(
+                label="将选中行设为「正文结束」",
+                command=lambda: self._set_body_end(iid))
+
+        menu.add_separator()
+        menu.add_command(label="清除正文范围",
+                         command=self._clear_body_range)
         menu.add_separator()
         menu.add_command(label="全部勾选",
                          command=lambda: self._set_checked(
@@ -1187,6 +1572,16 @@ class App:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def _clear_body_start(self):
+        self.body_start_idx = None
+        self._update_body_range_label()
+        self.refresh_tree()
+
+    def _clear_body_end(self):
+        self.body_end_idx = None
+        self._update_body_range_label()
+        self.refresh_tree()
 
     def _set_level_for_selected(self, level):
         for iid in self._get_selected_iids():
@@ -1257,6 +1652,9 @@ class App:
             self._bind_tooltip(self.file_label, path)
             self.all_paras = []
             self.items = []
+            self.body_start_idx = None
+            self.body_end_idx = None
+            self._update_body_range_label()
             self.refresh_tree()
 
     def detect_titles(self):
@@ -1269,29 +1667,44 @@ class App:
             messagebox.showerror("错误", f"读取文档失败：{e}")
             return
 
+        include_table = bool(self.include_table_var.get())
         self.items = []
         for p in self.all_paras:
-            level, source = detect_heading(p)
+            level, source = detect_heading(p, include_table=include_table)
             item = dict(p)
             if level:
                 item['is_title'] = True
                 item['level'] = level
-                item['source'] = source
+                src = source or ''
+                if p.get('in_table'):
+                    src = (src + ' [表格]').strip()
+                item['source'] = src
             self.items.append(item)
 
+        # 标题列表变了，正文范围标记失效
+        self.body_start_idx = None
+        self.body_end_idx = None
+        self._update_body_range_label()
         self.refresh_tree()
+
         n = sum(1 for x in self.items if x['is_title'])
+        tip = "" if include_table else "（未包含表格内段落）"
         messagebox.showinfo("识别完成",
-                            f"共识别到 {n} 个标题（目录段落已排除）")
+                            f"共识别到 {n} 个标题{tip}（目录段落已排除）\n"
+                            "右键标题行可标记「正文开始」/「正文结束」。")
 
     def refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
         shown = [it for it in self.items if it['is_title']]
         shown.sort(key=lambda x: x['index'])
         for i, it in enumerate(shown):
+            is_start = (it['index'] == self.body_start_idx)
+            is_end = (it['index'] == self.body_end_idx)
             self.tree.insert('', tk.END, iid=str(i), values=(
                 '✓', i + 1, it['level'], it['text'],
-                it['source'], it['index']))
+                it['source'], it['index'],
+                '起' if is_start else '',
+                '止' if is_end else ''))
 
     def on_tree_click(self, event):
         if self.tree.identify_region(event.x, event.y) != 'cell':
@@ -1382,6 +1795,12 @@ class App:
                 it['is_title'] = False
                 it['level'] = None
                 it['source'] = ''
+        # 正文标记可能失效
+        if self.body_start_idx in remove_idx:
+            self.body_start_idx = None
+        if self.body_end_idx in remove_idx:
+            self.body_end_idx = None
+        self._update_body_range_label()
         self.refresh_tree()
 
     def open_add_dialog(self):
@@ -1498,9 +1917,32 @@ class App:
         number_formats = self._collect_number_formats()
         num_levels = self._collect_enabled_num_levels()
 
-        if not num_levels and not fmt_levels:
+        body_format = None
+        if self.body_panel is not None and self.body_panel.is_enabled():
+            body_format = self.body_panel.get_settings()
+
+        # 校验：如果启用正文格式，必须设置正文范围
+        if body_format:
+            if self.body_start_idx is None or self.body_end_idx is None:
+                messagebox.showwarning(
+                    "提示",
+                    "启用正文格式前，需要先在标题列表中设置：\n"
+                    "  · 正文开始标题\n"
+                    "  · 正文结束标题\n\n"
+                    "请右键标题行，选择「将选中行设为『正文开始』」和\n"
+                    "「将选中行设为『正文结束』」。")
+                return
+            if self.body_start_idx >= self.body_end_idx:
+                messagebox.showwarning(
+                    "提示",
+                    "「正文开始」标题必须位于「正文结束」标题之前。\n"
+                    "请重新设置。")
+                return
+
+        if not num_levels and not fmt_levels and not body_format:
             messagebox.showwarning(
-                "提示", "编号面板与格式面板都没有启用任何级别，无需导出。")
+                "提示",
+                "编号、标题格式、正文格式都没有启用，无需导出。")
             return
 
         used_levels = {t['level'] for t in title_list}
@@ -1515,6 +1957,11 @@ class App:
 
         fmt_str = ','.join(str(x) for x in sorted(fmt_levels)) or '无'
         num_str = ','.join(str(x) for x in sorted(num_levels)) or '无'
+        body_str = '启用' if body_format else '未启用'
+
+        body_range = None
+        if body_format:
+            body_range = (self.body_start_idx, self.body_end_idx)
 
         def work(progress_cb):
             export_document(
@@ -1522,18 +1969,25 @@ class App:
                 templates, separators, number_formats,
                 fmt_levels, num_levels,
                 apply_format=apply_format,
+                body_format=body_format,
+                body_range=body_range,
                 progress_cb=progress_cb)
             return True
 
         def on_done(_):
             mode_txt = ("修改格式 + 重新编号" if apply_format
                         else "只重新编号")
+            range_txt = ""
+            if body_range:
+                range_txt = (f"\n  正文范围：段索引 "
+                             f"{body_range[0]} ~ {body_range[1]}")
             messagebox.showinfo(
                 "完成",
                 f"[{mode_txt}]\n"
-                f"  修改格式的级别：{fmt_str}\n"
+                f"  修改标题格式的级别：{fmt_str}\n"
                 f"  重新编号的级别：{num_str}\n"
-                f"  编号方式：纯文本编号（稳定可靠）\n"
+                f"  正文格式：{body_str}{range_txt}\n"
+                f"  编号方式：纯文本编号\n"
                 f"  输出文件：\n{out_path}")
 
         self._run_with_progress(work, on_done=on_done,
