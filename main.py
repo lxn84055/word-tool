@@ -3,9 +3,6 @@
 Word 标题识别、格式统一与自动编号工具
 依赖：pip install python-docx openpyxl
 运行：python main.py
-
-编号方案：直接在 docx 内部构造 w:numPr 多级编号，
-不依赖 Word COM，兼容 Microsoft Word 与 WPS。
 """
 
 import os
@@ -17,9 +14,8 @@ import warnings
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 
-# 屏蔽 python-docx 自身的 FutureWarning（不影响功能）
-warnings.filterwarnings(
-    "ignore", category=FutureWarning, module=r"docx(\..*)?")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -27,23 +23,13 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
 
-# 关系类型：优先用官方常量，拿不到就用字符串兜底
-try:
-    from docx.opc.constants import RELATIONSHIP_TYPE as RT
-    RT_NUMBERING = RT.NUMBERING
-except Exception:
-    RT = None
-    RT_NUMBERING = (
-        'http://schemas.openxmlformats.org/officeDocument/2006/'
-        'relationships/numbering'
-    )
-
-try:
-    from docx.opc.packuri import PackURI
-except Exception:
-    PackURI = None
-
 W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+
+# NUMBERING 关系类型的完整 URI（避免依赖 docx.opc.constants）
+RT_NUMBERING = (
+    'http://schemas.openxmlformats.org/officeDocument/2006/'
+    'relationships/numbering'
+)
 
 
 # =========================================================
@@ -93,8 +79,8 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
     格式面板、编号面板每级都有启用复选框，可只对某一级生效。
 
 五、编号实现
-    生成的是 Word 原生多级自动编号（w:numPr），
-    可在 Word 中继续编辑、调整层级，不依赖 Word COM。
+    优先使用 Word 原生多级自动编号（w:numPr）；
+    若文档无法承载编号定义，则自动回退为纯文本编号。
 
 六、常见示例
     一级：第{1}章 / 第一章
@@ -104,7 +90,7 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
 
 
 # =========================================================
-# 中文数字转换（纯文本回退时使用）
+# 中文数字转换
 # =========================================================
 
 _CN_DIGITS = '零一二三四五六七八九'
@@ -147,7 +133,7 @@ def num_to_chinese(n):
 
 
 # =========================================================
-# 文件名显示辅助
+# 文件名显示
 # =========================================================
 
 MAX_FILE_DISPLAY_CHARS = 46
@@ -306,7 +292,7 @@ def remove_old_number(text):
 
 
 # =========================================================
-# 编号生成（纯文本回退时使用）
+# 编号生成（纯文本）
 # =========================================================
 
 def generate_numbers(titles, templates, separators,
@@ -355,16 +341,6 @@ def generate_numbers(titles, templates, separators,
 # python-docx 段落 / 样式处理
 # =========================================================
 
-def _clear_paragraph_runs(p):
-    for r in list(p.runs):
-        r._element.getparent().remove(r._element)
-
-
-def _set_paragraph_text(p, text):
-    _clear_paragraph_runs(p)
-    p.add_run(text)
-
-
 def _replace_paragraph_text_preserving_format(p, new_text):
     runs = list(p.runs)
     if not runs:
@@ -381,6 +357,12 @@ def _replace_paragraph_text_preserving_format(p, new_text):
     for r in runs:
         if r is not base_run:
             r._element.getparent().remove(r._element)
+
+
+def _set_paragraph_text(p, text):
+    for r in list(p.runs):
+        r._element.getparent().remove(r._element)
+    p.add_run(text)
 
 
 def _remove_paragraph_numbering(p):
@@ -494,56 +476,63 @@ def _clean_and_style(doc, title_list, fmt_levels, num_levels):
 
 
 # =========================================================
-# ★ 核心：python-docx 直接构造 Word 自动编号
+# ★ 编号 Part 操作（完全避免 NumberingPart.new()）
 # =========================================================
+
+def _find_numbering_part(doc):
+    """遍历 OPC 关系查找 numbering part，找不到返回 None。"""
+    try:
+        for rel in doc.part.rels.values():
+            try:
+                if rel.reltype and rel.reltype.endswith('/numbering'):
+                    return rel.target_part
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
 
 def _ensure_numbering_element(doc):
     """
-    确保文档有 numbering part，返回它的根元素 <w:numbering>。
-
-    注意：
-      - 不能通过 doc.part.numbering_part 属性访问，因为当文档没有
-        numbering part 时，该属性会自动调用 NumberingPart.new()，
-        而 python-docx 的 NumberingPart.new() 未实现，会抛
-        NotImplementedError。
-      - 改用 part_related_by(RT.NUMBERING) 直接查询关系。
-      - 创建新 part 时使用 XmlPart 而非 NumberingPart。
+    返回 <w:numbering> 根元素。
+    优先复用已有 part；没有则创建一个新的 numbering part。
+    全程不触碰 doc.part.numbering_part（会触发 NotImplementedError）。
     """
-    # ---------- 1. 尝试获取已有 numbering part ----------
-    part = None
-    try:
-        part = doc.part.part_related_by(RT_NUMBERING)
-    except KeyError:
-        part = None
-    except Exception:
-        traceback.print_exc()
-        part = None
-
+    # 1. 查找已有 part
+    part = _find_numbering_part(doc)
     if part is not None:
+        # 尝试读取 element
         el = getattr(part, '_element', None)
-        if el is None:
-            try:
-                el = parse_xml(part.blob)
+        if el is not None:
+            return el
+        # 从 blob 解析
+        try:
+            blob = getattr(part, '_blob', None) or getattr(part, 'blob', None)
+            if blob:
+                el = parse_xml(blob)
                 try:
                     part._element = el
                 except Exception:
                     pass
-            except Exception:
-                traceback.print_exc()
-                el = None
-        if el is not None:
-            return el
+                return el
+        except Exception:
+            traceback.print_exc()
 
-    # ---------- 2. 新建 numbering part ----------
+    # 2. 创建新 part
     try:
         from docx.opc.part import XmlPart
+        from docx.opc.packuri import PackURI
+    except Exception:
+        traceback.print_exc()
+        return None
 
+    try:
         content_type = (
             'application/vnd.openxmlformats-officedocument'
             '.wordprocessingml.numbering+xml'
         )
         partname = PackURI('/word/numbering.xml')
-
         xml_bytes = (
             b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
             b'<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
@@ -554,8 +543,8 @@ def _ensure_numbering_element(doc):
         new_part = XmlPart(
             partname, content_type, element, doc.part.package)
 
+        # 建立 document part → numbering part 的关系
         doc.part.relate_to(new_part, RT_NUMBERING)
-
         return element
     except Exception:
         traceback.print_exc()
@@ -595,7 +584,7 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
     new_abs_id = _next_abstract_num_id(numbering_elm)
     new_num_id = _next_num_id(numbering_elm)
 
-    # ---- abstractNum ----
+    # abstractNum
     abs_el = OxmlElement('w:abstractNum')
     abs_el.set(qn('w:abstractNumId'), str(new_abs_id))
 
@@ -613,10 +602,9 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
 
         num_fmt_el = OxmlElement('w:numFmt')
         fmt = number_formats.get(lvl, 'arabic')
-        if fmt == 'chinese':
-            num_fmt_el.set(qn('w:val'), W_NUMFMT_CHINESE)
-        else:
-            num_fmt_el.set(qn('w:val'), W_NUMFMT_DECIMAL)
+        num_fmt_el.set(qn('w:val'),
+                       W_NUMFMT_CHINESE if fmt == 'chinese'
+                       else W_NUMFMT_DECIMAL)
         lvl_el.append(num_fmt_el)
 
         tmpl = templates.get(lvl)
@@ -645,14 +633,12 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
 
         abs_el.append(lvl_el)
 
-    # abstractNum 必须放在 num 之前
     first_num = numbering_elm.find(qn('w:num'))
     if first_num is not None:
         first_num.addprevious(abs_el)
     else:
         numbering_elm.append(abs_el)
 
-    # ---- num ----
     num_el = OxmlElement('w:num')
     num_el.set(qn('w:numId'), str(new_num_id))
     abs_ref = OxmlElement('w:abstractNumId')
@@ -664,7 +650,6 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
 
 
 def _apply_numpr_to_paragraph(p, num_id, level):
-    """给段落应用多级编号（写入段落级 w:numPr）。"""
     pPr = p._p.get_or_add_pPr()
     old = pPr.find(qn('w:numPr'))
     if old is not None:
@@ -676,7 +661,6 @@ def _apply_numpr_to_paragraph(p, num_id, level):
 
 def _apply_text_numbers(doc, title_list, templates, separators,
                         number_formats, num_levels):
-    """纯文本编号回退：把编号直接写入标题文字前。"""
     sorted_titles = sorted(title_list, key=lambda x: x['index'])
     nums = generate_numbers(sorted_titles, templates, separators,
                             number_formats, num_levels)
@@ -712,6 +696,7 @@ def _run_numbering(doc, title_list, templates, separators,
 
     if use_auto_number:
         report(base_pct, "创建 Word 多级自动编号...")
+        num_id = None
         try:
             num_id = _add_multilevel_numbering_to_doc(
                 doc, templates, separators, number_formats)
@@ -1145,7 +1130,8 @@ class AddParagraphDialog:
         self.all_paras = all_paras
         self.existing = set(existing_indexes)
 
-        ttk.Label(self.top, text="勾选要添加为标题的段落（可多选）").pack(
+        ttk.Label(self.top,
+                  text="勾选要添加为标题的段落（可多选）").pack(
             anchor='w', padx=8, pady=6)
 
         cols = ("选择", "序号", "样式", "大纲", "内容")
@@ -1207,7 +1193,8 @@ class AddParagraphDialog:
         self.tree.item(iid, values=vals)
 
     def confirm(self):
-        self.result = [int(iid) for iid, chk in self.check_state.items() if chk]
+        self.result = [int(iid) for iid, chk
+                       in self.check_state.items() if chk]
         self.top.destroy()
 
 
@@ -1270,7 +1257,8 @@ class App:
         body = scroll.inner
 
         mid = ttk.LabelFrame(
-            body, text="标题列表（点击第一列勾选/取消；双击级别或标题文字列可修改）")
+            body,
+            text="标题列表（点击第一列勾选/取消；双击级别或标题文字列可修改）")
         mid.pack(fill=tk.X, padx=2, pady=4)
 
         quick = ttk.Frame(mid)
@@ -1487,7 +1475,8 @@ class App:
             self.tree.selection_set(iid)
 
         menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="切换选中 (Space)", command=self._toggle_selected)
+        menu.add_command(label="切换选中 (Space)",
+                         command=self._toggle_selected)
         menu.add_separator()
         menu.add_command(label="全部勾选",
                          command=lambda: self._set_checked(
@@ -1604,7 +1593,8 @@ class App:
 
         self.refresh_tree()
         n = sum(1 for x in self.items if x['is_title'])
-        messagebox.showinfo("识别完成", f"共识别到 {n} 个标题（目录段落已排除）")
+        messagebox.showinfo("识别完成",
+                            f"共识别到 {n} 个标题（目录段落已排除）")
 
     def refresh_tree(self):
         self.tree.delete(*self.tree.get_children())
@@ -1655,7 +1645,8 @@ class App:
                 if not 1 <= lv <= 9:
                     raise ValueError
             except ValueError:
-                messagebox.showerror("错误", "级别必须是 1~9 的整数", parent=win)
+                messagebox.showerror("错误", "级别必须是 1~9 的整数",
+                                     parent=win)
                 return
             vals[2] = lv
             self.tree.item(iid, values=vals)
@@ -1799,7 +1790,8 @@ class App:
 
         title_list = self._collect_checked_titles()
         if not title_list:
-            messagebox.showwarning("提示", "列表中没有任何被勾选、且级别有效的标题")
+            messagebox.showwarning("提示",
+                                   "列表中没有任何被勾选、且级别有效的标题")
             return
 
         out_path = filedialog.asksaveasfilename(
@@ -1820,8 +1812,7 @@ class App:
 
         if not num_levels and not fmt_levels:
             messagebox.showwarning(
-                "提示",
-                "编号面板与格式面板都没有启用任何级别，无需导出。")
+                "提示", "编号面板与格式面板都没有启用任何级别，无需导出。")
             return
 
         used_levels = {t['level'] for t in title_list}
@@ -1849,7 +1840,8 @@ class App:
 
         def on_done(used_auto):
             method = "Word 自动编号" if used_auto else "纯文本编号"
-            mode_txt = "修改格式 + 重新编号" if apply_format else "只重新编号"
+            mode_txt = ("修改格式 + 重新编号" if apply_format
+                        else "只重新编号")
             messagebox.showinfo(
                 "完成",
                 f"[{mode_txt}]\n"
@@ -1867,7 +1859,8 @@ class App:
             return
         title_list = self._collect_checked_titles()
         if not title_list:
-            messagebox.showwarning("提示", "列表中没有任何被勾选、且级别有效的标题")
+            messagebox.showwarning("提示",
+                                   "列表中没有任何被勾选、且级别有效的标题")
             return
 
         path = filedialog.asksaveasfilename(
