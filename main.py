@@ -13,8 +13,13 @@ import re
 import traceback
 import threading
 import queue
+import warnings
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
+
+# 屏蔽 python-docx 自身的 FutureWarning（不影响功能）
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, module=r"docx(\..*)?")
 
 from docx import Document
 from docx.shared import Pt, RGBColor
@@ -27,6 +32,7 @@ try:
     from docx.opc.packuri import PackURI
 except Exception:
     RT = None
+    PackURI = None
 
 W_NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
 
@@ -90,7 +96,7 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
 
 
 # =========================================================
-# 中文数字转换（回退纯文本时使用）
+# 中文数字转换（纯文本回退时使用）
 # =========================================================
 
 _CN_DIGITS = '零一二三四五六七八九'
@@ -488,49 +494,36 @@ def _ensure_numbering_element(doc):
     确保文档有 numbering part，返回它的根元素 <w:numbering>。
     若不存在则新建一个并建立关系。
     """
-    # 1. 已有 numbering part
+    # 1. 已有 numbering part（大多数 Word 文档都有）
     try:
         part = doc.part.numbering_part
-        if part is not None:
+        if part is not None and part.element is not None:
             return part.element
     except Exception:
         pass
 
-    # 2. 创建新的
+    # 2. 创建新的 numbering part（用 NumberingPart.load，而非 new）
     try:
         from docx.parts.numbering import NumberingPart
-        part = NumberingPart.new()
-        # 确保有 <w:numbering> 根
-        if part.element is None:
-            part._element = parse_xml(
-                '<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
-                'wordprocessingml/2006/main"/>'
-            )
+
+        content_type = ('application/vnd.openxmlformats-officedocument'
+                        '.wordprocessingml.numbering+xml')
+        partname = PackURI('/word/numbering.xml')
+
+        xml_bytes = (
+            b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n'
+            b'<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
+            b'wordprocessingml/2006/main"/>'
+        )
+
+        part = NumberingPart.load(
+            partname, content_type, xml_bytes, doc.part.package)
         if RT is not None:
             doc.part.relate_to(part, RT.NUMBERING)
         return part.element
     except Exception:
         traceback.print_exc()
-        # 3. 兜底：直接用空的 numbering 元素
-        element = parse_xml(
-            '<w:numbering xmlns:w="http://schemas.openxmlformats.org/'
-            'wordprocessingml/2006/main"/>'
-        )
-        try:
-            from docx.opc.part import Part
-            content_type = ('application/vnd.openxmlformats-officedocument'
-                            '.wordprocessingml.numbering+xml')
-            part = Part(
-                PackURI('/word/numbering.xml'),
-                content_type,
-                element,
-                doc.part.package,
-            )
-            if RT is not None:
-                doc.part.relate_to(part, RT.NUMBERING)
-        except Exception:
-            traceback.print_exc()
-        return element
+        return None
 
 
 def _next_abstract_num_id(numbering_elm):
@@ -563,6 +556,8 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
     在文档里创建一个多级编号定义，返回新 numId。
     """
     numbering_elm = _ensure_numbering_element(doc)
+    if numbering_elm is None:
+        return None
 
     new_abs_id = _next_abstract_num_id(numbering_elm)
     new_num_id = _next_num_id(numbering_elm)
@@ -597,7 +592,6 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
             w_tmpl = re.sub(r'\{(\d+)\}', lambda m: '%' + m.group(1), tmpl)
             w_tmpl = re.sub(r'\{\d+\}', '', w_tmpl)
             sep = separators.get(lvl, ' ')
-            # 制表符会被 Word 特殊处理；直接作为字符写入也可
             text_val = w_tmpl + sep
         else:
             text_val = '%' + str(lvl) + '.'
@@ -610,7 +604,6 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
         lvl_jc.set(qn('w:val'), 'left')
         lvl_el.append(lvl_jc)
 
-        # 缩进：不缩进
         ppr = OxmlElement('w:pPr')
         ind = OxmlElement('w:ind')
         ind.set(qn('w:left'), '0')
@@ -641,7 +634,6 @@ def _add_multilevel_numbering_to_doc(doc, templates, separators,
 def _apply_numpr_to_paragraph(p, num_id, level):
     """给段落应用多级编号（写入段落级 w:numPr）。"""
     pPr = p._p.get_or_add_pPr()
-    # 移除旧的 numPr
     old = pPr.find(qn('w:numPr'))
     if old is not None:
         pPr.remove(old)
@@ -1152,8 +1144,10 @@ class AddParagraphDialog:
 
         btns = ttk.Frame(self.top)
         btns.pack(fill=tk.X, padx=8, pady=6)
-        ttk.Button(btns, text="取消", command=self.top.destroy).pack(side=tk.RIGHT, padx=4)
-        ttk.Button(btns, text="确定", command=self.confirm).pack(side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="取消", command=self.top.destroy).pack(
+            side=tk.RIGHT, padx=4)
+        ttk.Button(btns, text="确定", command=self.confirm).pack(
+            side=tk.RIGHT, padx=4)
 
         self.top.transient(parent)
         self.top.grab_set()
@@ -1295,10 +1289,12 @@ class App:
         self.mode_var = tk.StringVar(value='reformat')
         ttk.Radiobutton(mode_wrap, text="重新编号 + 修改标题格式",
                         variable=self.mode_var, value='reformat',
-                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=2)
+                        command=self.on_mode_change).pack(
+            side=tk.LEFT, padx=10, pady=2)
         ttk.Radiobutton(mode_wrap, text="只重新编号（保持原标题格式）",
                         variable=self.mode_var, value='renumber_only',
-                        command=self.on_mode_change).pack(side=tk.LEFT, padx=10, pady=2)
+                        command=self.on_mode_change).pack(
+            side=tk.LEFT, padx=10, pady=2)
 
         paned = ttk.Frame(body)
         paned.pack(fill=tk.X, padx=2, pady=2)
@@ -1311,7 +1307,8 @@ class App:
         fmt_wrap = ttk.LabelFrame(
             left, text="按级别统一设置格式（每级可单独启用/禁用）")
         fmt_wrap.pack(fill=tk.X)
-        default_fonts = {1: ('黑体', 16, True), 2: ('楷体', 14, True), 3: ('宋体', 12, False)}
+        default_fonts = {1: ('黑体', 16, True), 2: ('楷体', 14, True),
+                         3: ('宋体', 12, False)}
         for lvl in (1, 2, 3):
             fn, fs, bd = default_fonts[lvl]
             self.format_panels[lvl] = LevelFormatPanel(fmt_wrap, lvl, {
@@ -1341,7 +1338,8 @@ class App:
             row.pack(fill=tk.X, padx=4, pady=3)
 
             ev = tk.BooleanVar(value=True)
-            ttk.Checkbutton(row, variable=ev, width=2).pack(side=tk.LEFT, padx=(2, 8))
+            ttk.Checkbutton(row, variable=ev,
+                            width=2).pack(side=tk.LEFT, padx=(2, 8))
             self.num_enabled_vars[lvl] = ev
 
             ttk.Label(row, text=f"{lvl} 级", width=5).pack(side=tk.LEFT)
@@ -1464,9 +1462,11 @@ class App:
         menu.add_command(label="切换选中 (Space)", command=self._toggle_selected)
         menu.add_separator()
         menu.add_command(label="全部勾选",
-                         command=lambda: self._set_checked(self._get_all_iids(), True))
+                         command=lambda: self._set_checked(
+                             self._get_all_iids(), True))
         menu.add_command(label="全部取消",
-                         command=lambda: self._set_checked(self._get_all_iids(), False))
+                         command=lambda: self._set_checked(
+                             self._get_all_iids(), False))
         menu.add_command(label="反选", command=self._invert_checked)
         menu.add_separator()
         menu.add_command(label="将选中行设为 1 级",
@@ -1584,7 +1584,8 @@ class App:
         shown.sort(key=lambda x: x['index'])
         for i, it in enumerate(shown):
             self.tree.insert('', tk.END, iid=str(i), values=(
-                '✓', i + 1, it['level'], it['text'], it['source'], it['index']))
+                '✓', i + 1, it['level'], it['text'],
+                it['source'], it['index']))
 
     def on_tree_click(self, event):
         if self.tree.identify_region(event.x, event.y) != 'cell':
@@ -1640,7 +1641,8 @@ class App:
         vals = list(self.tree.item(iid, 'values'))
         win = tk.Toplevel(self.root)
         win.title("修改标题文字")
-        ttk.Label(win, text="编辑标题文字（可手动去掉旧编号）：").pack(padx=10, pady=6)
+        ttk.Label(win, text="编辑标题文字（可手动去掉旧编号）：").pack(
+            padx=10, pady=6)
         txt = tk.Text(win, width=60, height=4)
         txt.pack(padx=10, pady=4)
         txt.insert('1.0', str(vals[3]))
@@ -1710,7 +1712,8 @@ class App:
 
     def _collect_templates(self):
         return {lvl: var.get().strip()
-                for lvl, var in self.template_vars.items() if var.get().strip()}
+                for lvl, var in self.template_vars.items()
+                if var.get().strip()}
 
     def _collect_separators(self):
         return {lvl: SEP_MAP.get(var.get(), var.get())
