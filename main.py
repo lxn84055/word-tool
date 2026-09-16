@@ -5,7 +5,7 @@ Word 工具集
 运行：python main.py
 
 Tab1：标题处理（识别、重编号、格式统一）
-Tab2：表格提取到 Excel（表格 + 正文都提取）
+Tab2：表格/正文提取到 Excel（支持正文在表格中的情况）
 """
 
 import os
@@ -755,7 +755,9 @@ def _find_first_colon(line):
 
 def _is_heading_paragraph(p):
     """
-    判断段落是否为标题段落（有大纲级别或标题样式）。
+    判断段落是否为标题段落：
+      - Word 标题样式（Heading N / 标题 N）
+      - 或段落 XML 中带大纲级别（outlineLvl）
     """
     try:
         style_name = p.style.name if p.style else ''
@@ -784,7 +786,7 @@ def _is_heading_paragraph(p):
 
 def _parse_paragraph_block(paragraphs):
     """
-    解析一段段落列表（正文或单元格内），返回 {列名: 内容}。
+    解析一段段落列表，返回 {列名: 内容}。
     规则：
       - 每段 "列名: 内容" 开始新字段
       - 后续段落作为内容，直到遇到下一个 "列名:" 或标题段落
@@ -804,7 +806,6 @@ def _parse_paragraph_block(paragraphs):
         except Exception:
             text = ''
 
-        # 空段落：保留空行
         if not text:
             if current_key is not None:
                 current_value_lines.append('')
@@ -834,20 +835,42 @@ def _parse_paragraph_block(paragraphs):
     return result
 
 
-def _parse_single_cell_text(cell):
-    """单格表格 cell 解析：复用段落块解析逻辑。"""
+def _parse_cell_blocks(cell):
+    """
+    解析单个单元格，按标题段落切分成多个数据块，
+    返回 list[dict]。
+    每个 dict 对应 Excel 的一行。
+    """
     try:
         paragraphs = list(cell.paragraphs)
     except Exception:
-        return {}
-    return _parse_paragraph_block(paragraphs)
+        return []
+
+    rows = []
+    current_block = []
+
+    def flush_block():
+        if current_block:
+            row_data = _parse_paragraph_block(current_block)
+            if row_data:
+                rows.append(row_data)
+
+    for p in paragraphs:
+        if _is_heading_paragraph(p):
+            flush_block()
+            current_block = []
+            continue
+        current_block.append(p)
+
+    flush_block()
+    return rows
 
 
 def _parse_one_table(table):
     """
-    解析一个表格，返回 {列名: 内容}。
-    - 单格表格：按段落块规则解析。
-    - 多格表格：最左列为列名，右侧第一列为内容，忽略其他列/行。
+    解析一个表格，返回 list[dict]，每个 dict 对应 Excel 的一行。
+    - 单格表格：按标题段落切分成多个数据块，每块一行。
+    - 多格表格：最左列为列名，右侧第一列为内容；整个表格合成一行。
     """
     try:
         nrows = len(table.rows)
@@ -856,15 +879,17 @@ def _parse_one_table(table):
         nrows = ncols = 0
 
     if nrows == 0 or ncols == 0:
-        return {}
+        return []
 
     if nrows == 1 and ncols == 1:
+        # 单格表格
         try:
             cell = table.cell(0, 0)
         except Exception:
-            return {}
-        return _parse_single_cell_text(cell)
+            return []
+        return _parse_cell_blocks(cell)
 
+    # 多格表格：整个表格合成一行（每行的最左列作为列名）
     result = {}
     for r in table.rows:
         try:
@@ -877,7 +902,7 @@ def _parse_one_table(table):
         value = cells[1].text.strip()
         if key and key not in result:
             result[key] = value
-    return result
+    return [result] if result else []
 
 
 def extract_from_body_paragraphs(doc):
@@ -887,7 +912,6 @@ def extract_from_body_paragraphs(doc):
     """
     from docx.text.paragraph import Paragraph
 
-    # 只取正文直属段落（不含表格内段落）
     body_paragraphs = []
     for p_el in doc.element.body.iter(qn('w:p')):
         p = Paragraph(p_el, doc)
@@ -905,7 +929,6 @@ def extract_from_body_paragraphs(doc):
                 rows.append(row_data)
 
     for p in body_paragraphs:
-        # 标题段落作为切分点
         if _is_heading_paragraph(p):
             flush_block()
             current_block = []
@@ -924,13 +947,16 @@ def extract_tables_from_word(docx_path):
     doc = Document(docx_path)
     rows = []
 
-    # 1. 提取所有表格
+    # 1. 提取所有表格（每个表格可能产生多行）
     for table in doc.tables:
-        row_data = _parse_one_table(table)
-        if row_data:
-            rows.append(row_data)
+        try:
+            table_rows = _parse_one_table(table)
+        except Exception:
+            traceback.print_exc()
+            table_rows = []
+        rows.extend(table_rows)
 
-    # 2. 提取正文段落
+    # 2. 提取正文段落（排除表格内）
     try:
         body_rows = extract_from_body_paragraphs(doc)
         rows.extend(body_rows)
@@ -2379,12 +2405,13 @@ class TableExtractApp(ttk.Frame):
         ttk.Label(
             info, justify='left',
             text=(
-                "· 提取范围：Word 中的所有表格 + 正文段落\n"
-                "· 多格表格：最左列为列名，右侧第一列为内容，忽略其他列/行\n"
-                "· 单格表格 / 正文段落：按 \"列名: 内容\" 解析，\n"
-                "  内容可以跨多行，直到遇到下一个 \"列名:\" 或标题段落时结束\n"
-                "· 正文按标题段落切分成多个数据块，每块占 Excel 的一行\n"
-                "· 多个数据块列名相同时，写在同列下；每块占 Excel 一行"),
+                "· 提取范围：Word 中的所有表格 + 正文段落（排除表格内的）\n"
+                "· 单格表格：按标题段落切分成多个数据块，每块占 Excel 一行；\n"
+                "  单元格内每段 \"列名: 内容\" 开始新字段，内容可以跨多行，\n"
+                "  直到遇到下一个 \"列名:\" 或标题段落时结束\n"
+                "· 多格表格：最左列为列名，右侧第一列为内容；整个表格合成一行\n"
+                "· 多个数据块列名相同时，写在同列下\n"
+                "· 支持表格内嵌套的标题（Word 标题样式或大纲级别）"),
             foreground='#444'
         ).pack(anchor='w', padx=8, pady=6)
 
