@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Word 标题识别、格式统一与重新编号工具
+Word 工具集
 依赖：pip install python-docx openpyxl
 运行：python main.py
 
-编号方案：纯文本编号，直接写入标题文字前，稳定可靠。
-正文格式：只应用到用户指定的"正文开始标题"与"正文结束标题"之间。
+Tab1：标题处理（识别、重编号、格式统一）
+Tab2：表格提取到 Excel
 """
 
 import os
@@ -61,6 +61,48 @@ LINE_SPACING_MAP = {
     "最小值(磅)": "atleast",
 }
 
+FONT_PRESETS = [
+    "宋体", "黑体", "楷体", "仿宋", "微软雅黑", "等线",
+    "华文中宋", "华文楷体", "华文仿宋", "华文行楷",
+    "方正小标宋简体", "方正黑体简体",
+    "Times New Roman", "Arial", "Calibri", "Cambria",
+    "Georgia", "Verdana", "Tahoma", "Courier New",
+]
+
+FONT_SIZE_MAP = {
+    "初号": 42.0, "小初": 36.0,
+    "一号": 26.0, "小一": 24.0,
+    "二号": 22.0, "小二": 18.0,
+    "三号": 16.0, "小三": 15.0,
+    "四号": 14.0, "小四": 12.0,
+    "五号": 10.5, "小五": 9.0,
+    "六号": 7.5, "小六": 6.5,
+    "七号": 5.5, "八号": 5.0,
+}
+FONT_SIZE_PRESETS = list(FONT_SIZE_MAP.keys())
+
+
+def parse_font_size(text):
+    if text is None:
+        return None
+    text = str(text).strip()
+    if not text:
+        return None
+    if text in FONT_SIZE_MAP:
+        return FONT_SIZE_MAP[text]
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    m = re.search(r'(\d+(?:\.\d+)?)', text)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
 TEMPLATE_HELP_TEXT = """编号模板编写原则
 ============================
 
@@ -74,20 +116,17 @@ TEMPLATE_HELP_TEXT = """编号模板编写原则
     4. 若上级标题未出现，上级序号按 1 显示。
 
 三、数字格式
-    可选"阿拉伯数字"或"中文数字"：
-        阿拉伯数字：1、2、3
-        中文数字：  一、二、三、十、十一、...
+    可选"阿拉伯数字"或"中文数字"。
 
-四、正文范围
+四、字体与字号
+    字体下拉框提供常用中英文字体，也可手动输入。
+    字号下拉框提供中文号数，也可直接输入磅值。
+
+五、正文范围
     需在标题列表中指定"正文开始标题"和"正文结束标题"：
       - 右键点击标题行 → "设为正文开始" / "设为正文结束"
-      - 正文格式只应用到这两个标题之间的非标题段落
-      - 开始标题之前、结束标题之后的段落不受影响
-
-五、常见示例
-    一级：第{1}章 / 第一章
-    二级：{1}.{2} / 第{1}节
-    三级：{1}.{2}.{3} / （{3}）
+      - 如果"正文结束"是最后一个标题，它之后的段落一直
+        到文档末尾都算正文。
 """
 
 
@@ -165,7 +204,6 @@ def truncate_path(path, max_chars=MAX_FILE_DISPLAY_CHARS):
 # =========================================================
 
 def _all_paragraph_objs(doc):
-    """返回文档中所有段落对象（含表格内段落），按文档顺序。"""
     from docx.text.paragraph import Paragraph
     result = []
     for p_el in doc.element.body.iter(qn('w:p')):
@@ -174,7 +212,6 @@ def _all_paragraph_objs(doc):
 
 
 def _is_in_table(p):
-    """判断段落是否在表格单元格内。"""
     parent = p._p.getparent()
     while parent is not None:
         if parent.tag == qn('w:tc'):
@@ -212,7 +249,7 @@ def is_toc_paragraph(paragraph):
 
 
 # =========================================================
-# 文档解析
+# 文档解析（标题处理）
 # =========================================================
 
 def get_outline_level(paragraph):
@@ -496,11 +533,6 @@ def _apply_run_font(run, fmt):
 
 def _apply_body_format(doc, all_paras, title_indexes, body_fmt,
                        body_range=None):
-    """
-    对指定范围内的非标题、非空段落应用正文格式。
-    body_range: (start_idx, end_idx) —— 只处理 start < i < end 的段落。
-                None 表示不限制范围（应用到全文档的非标题段落）。
-    """
     if not body_fmt:
         return
     start_idx, end_idx = (body_range if body_range else (None, None))
@@ -509,7 +541,6 @@ def _apply_body_format(doc, all_paras, title_indexes, body_fmt,
             continue
         if not p.text.strip():
             continue
-        # 范围过滤
         if start_idx is not None and i <= start_idx:
             continue
         if end_idx is not None and i >= end_idx:
@@ -553,7 +584,7 @@ def _apply_body_format(doc, all_paras, title_indexes, body_fmt,
 
 
 # =========================================================
-# 核心导出
+# 核心导出（标题处理）
 # =========================================================
 
 def export_document(src_path, out_path, titles, format_settings,
@@ -562,14 +593,6 @@ def export_document(src_path, out_path, titles, format_settings,
                     apply_format=True, body_format=None,
                     body_range=None,
                     progress_cb=None):
-    """
-    处理顺序：
-      1. 删除旧编号
-      2. 写入新编号
-      3. 修改标题格式
-      4. 修改正文格式（只对 body_range 内的非标题段落）
-      5. 另存为新文件
-    """
     def report(pct, msg=None):
         if progress_cb:
             try:
@@ -591,7 +614,6 @@ def export_document(src_path, out_path, titles, format_settings,
     doc = Document(src_path)
     all_paras = _all_paragraph_objs(doc)
 
-    # ---------- 1. 删除旧编号 ----------
     report(20, "删除旧编号...")
     _remove_style_numbering(doc, num_levels)
     for t in title_list:
@@ -606,7 +628,6 @@ def export_document(src_path, out_path, titles, format_settings,
             _replace_paragraph_text_preserving_format(p, clean)
         _remove_paragraph_numbering(p)
 
-    # ---------- 2. 写入新编号 ----------
     report(40, "生成新编号...")
     nums = generate_numbers(title_list, templates, separators,
                             number_formats, num_levels)
@@ -628,7 +649,6 @@ def export_document(src_path, out_path, titles, format_settings,
             report(50 + int(15 * written / total_num),
                    f"写入编号 {written}/{total_num}")
 
-    # ---------- 3. 修改标题格式 ----------
     if apply_format:
         report(70, "应用标题样式与格式...")
         for t in title_list:
@@ -644,14 +664,12 @@ def export_document(src_path, out_path, titles, format_settings,
         report(80, "应用标题样式属性...")
         _apply_format_to_styles(doc, format_settings)
 
-    # ---------- 4. 修改正文格式 ----------
     if body_format:
         report(85, "应用正文格式...")
         title_indexes = {t['index'] for t in title_list}
         _apply_body_format(doc, all_paras, title_indexes, body_format,
                            body_range=body_range)
 
-    # ---------- 5. 保存 ----------
     report(95, "保存文档...")
     doc.save(out_path)
     report(100, "完成")
@@ -719,7 +737,201 @@ def export_titles_list(titles, file_path, templates, separators,
 
 
 # =========================================================
-# GUI
+# ★ 表格提取到 Excel
+# =========================================================
+
+def _find_first_colon(line):
+    """查找中/英文冒号，返回最靠前的索引，无则 -1。"""
+    idx_cn = line.find('：')
+    idx_en = line.find(':')
+    if idx_cn >= 0 and idx_en >= 0:
+        return min(idx_cn, idx_en)
+    if idx_cn >= 0:
+        return idx_cn
+    if idx_en >= 0:
+        return idx_en
+    return -1
+
+
+def _is_heading_paragraph(p):
+    """
+    判断段落是否为标题段落（有大纲级别或标题样式）。
+    用于单格表格解析：单元格内出现标题段落时，结束当前字段。
+    """
+    try:
+        style_name = p.style.name if p.style else ''
+    except Exception:
+        style_name = ''
+    if style_name:
+        if re.match(r'^(?:Heading|标题)\s*\d+', style_name.strip(), re.I):
+            return True
+    try:
+        pPr = p._p.pPr
+        if pPr is not None:
+            ol = pPr.find(W_NS + 'outlineLvl')
+            if ol is not None:
+                val = ol.get(W_NS + 'val')
+                if val is not None:
+                    try:
+                        n = int(val)
+                        if 0 <= n <= 8:
+                            return True
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+    return False
+
+
+def _parse_single_cell_text(cell):
+    """
+    解析单格表格的 cell：
+      - 每行 "列名: 内容" 或 "列名：内容" 开始一个新字段
+      - 字段内容可以跨多行，直到遇到：
+          · 下一个 "列名:"
+          · 或单元格内出现标题段落（大纲级别 / 标题样式）
+    """
+    result = {}
+    try:
+        paragraphs = list(cell.paragraphs)
+    except Exception:
+        return result
+
+    current_key = None
+    current_value_lines = []
+
+    def flush():
+        if current_key is not None:
+            result[current_key] = '\n'.join(current_value_lines).strip()
+
+    for p in paragraphs:
+        text = p.text.strip()
+
+        # 空段落：若在字段中，保留空行
+        if not text:
+            if current_key is not None:
+                current_value_lines.append('')
+            continue
+
+        # ★ 单元格内出现标题段落 → 结束当前字段
+        if _is_heading_paragraph(p):
+            flush()
+            current_key = None
+            current_value_lines = []
+            continue
+
+        idx = _find_first_colon(text)
+        if idx >= 0:
+            key = text[:idx].strip()
+            value = text[idx + 1:].strip()
+            if key:
+                flush()
+                current_key = key
+                current_value_lines = [value] if value else []
+                continue
+
+        # 续上一字段内容
+        if current_key is not None:
+            current_value_lines.append(text)
+
+    flush()
+    return result
+
+
+def _parse_one_table(table):
+    """
+    解析一个表格，返回 {列名: 内容}。
+    - 单格表格：按 "列名: 内容" 解析。
+    - 多格表格：最左列为列名，右侧第一列为内容，忽略其他列/行。
+    """
+    try:
+        nrows = len(table.rows)
+        ncols = len(table.columns)
+    except Exception:
+        nrows = ncols = 0
+
+    if nrows == 0 or ncols == 0:
+        return {}
+
+    if nrows == 1 and ncols == 1:
+        try:
+            cell = table.cell(0, 0)
+        except Exception:
+            return {}
+        return _parse_single_cell_text(cell)
+
+    result = {}
+    for r in table.rows:
+        try:
+            cells = r.cells
+        except Exception:
+            continue
+        if len(cells) < 2:
+            continue
+        key = cells[0].text.strip()
+        value = cells[1].text.strip()
+        if key and key not in result:
+            result[key] = value
+    return result
+
+
+def extract_tables_from_word(docx_path):
+    """从 Word 文档提取所有表格，返回 (columns, rows)。"""
+    doc = Document(docx_path)
+    rows = []
+    for table in doc.tables:
+        row_data = _parse_one_table(table)
+        if row_data:
+            rows.append(row_data)
+
+    # 汇总列名（按首次出现顺序）
+    columns = []
+    seen = set()
+    for r in rows:
+        for k in r.keys():
+            if k and k not in seen:
+                columns.append(k)
+                seen.add(k)
+
+    return columns, rows
+
+
+def export_tables_to_excel(columns, rows, file_path):
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment
+    except ImportError:
+        raise RuntimeError(
+            "导出 Excel 需要安装 openpyxl：\n    pip install openpyxl"
+        )
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "表格数据"
+    ws.append(columns)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal='center', vertical='center')
+
+    for r in rows:
+        ws.append([r.get(c, '') for c in columns])
+
+    # 列宽自适应
+    for i, col in enumerate(columns, 1):
+        max_len = len(str(col))
+        for r in rows:
+            v = str(r.get(col, ''))
+            for line in v.split('\n'):
+                est = sum(2 if ord(ch) > 127 else 1 for ch in line)
+                max_len = max(max_len, est)
+        letter = ws.cell(row=1, column=i).column_letter
+        ws.column_dimensions[letter].width = min(60, max(8, max_len + 2))
+
+    wb.save(file_path)
+
+
+# =========================================================
+# GUI 部件（标题处理）
 # =========================================================
 
 ALIGN_MAP = {
@@ -732,7 +944,7 @@ ALIGN_NAMES = list(ALIGN_MAP.keys())
 def show_template_help(parent):
     win = tk.Toplevel(parent)
     win.title("编号模板编写原则")
-    win.geometry("680x660")
+    win.geometry("680x700")
     txt = tk.Text(win, wrap='word', font=('Consolas', 10))
     txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     txt.insert('1.0', TEMPLATE_HELP_TEXT)
@@ -874,20 +1086,30 @@ class LevelFormatPanel:
         row1 = ttk.Frame(self.body)
         row1.pack(fill=tk.X, pady=2)
         ttk.Label(row1, text="字体").pack(side=tk.LEFT)
-        self.font_var = tk.StringVar(value=defaults.get('font_name', '宋体'))
-        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(
+        self.font_var = tk.StringVar(
+            value=defaults.get('font_name', '宋体'))
+        ttk.Combobox(row1, textvariable=self.font_var,
+                     values=FONT_PRESETS, width=14).pack(
             side=tk.LEFT, padx=(2, 6))
+
         ttk.Label(row1, text="字号").pack(side=tk.LEFT)
-        self.size_var = tk.IntVar(value=defaults.get('font_size', 14))
-        ttk.Spinbox(row1, from_=8, to=72, textvariable=self.size_var,
-                    width=4).pack(side=tk.LEFT, padx=(2, 6))
+        default_size = defaults.get('font_size_name', '小四')
+        self.size_var = tk.StringVar(value=default_size)
+        ttk.Combobox(row1, textvariable=self.size_var,
+                     values=FONT_SIZE_PRESETS, width=8).pack(
+            side=tk.LEFT, padx=(2, 6))
+
         self.bold_var = tk.BooleanVar(value=defaults.get('bold', True))
         ttk.Checkbutton(row1, text="加粗",
-                        variable=self.bold_var).pack(side=tk.LEFT, padx=(0, 6))
+                        variable=self.bold_var).pack(
+            side=tk.LEFT, padx=(0, 6))
+
         ttk.Label(row1, text="对齐").pack(side=tk.LEFT)
         self.align_var = tk.StringVar(value=defaults.get('align', '左对齐'))
         ttk.Combobox(row1, textvariable=self.align_var, values=ALIGN_NAMES,
-                     width=7, state='readonly').pack(side=tk.LEFT, padx=(2, 6))
+                     width=7, state='readonly').pack(
+            side=tk.LEFT, padx=(2, 6))
+
         ttk.Label(row1, text="颜色").pack(side=tk.LEFT)
         self.color_rgb = defaults.get('color_rgb', (0, 0, 0))
         self.color_btn = tk.Button(row1, text="  ",
@@ -918,7 +1140,11 @@ class LevelFormatPanel:
                 pass
             for sub in w.winfo_children():
                 try:
-                    sub.configure(state=state)
+                    if isinstance(sub, ttk.Combobox):
+                        sub.configure(state='normal' if enabled
+                                      else 'disabled')
+                    else:
+                        sub.configure(state=state)
                 except Exception:
                     pass
 
@@ -936,9 +1162,12 @@ class LevelFormatPanel:
             self.color_btn.config(bg=hx)
 
     def get_settings(self):
+        size_val = parse_font_size(self.size_var.get())
+        if size_val is None:
+            size_val = 12.0
         return {
             'font_name': self.font_var.get().strip(),
-            'font_size': int(self.size_var.get()),
+            'font_size': size_val,
             'bold': bool(self.bold_var.get()),
             'color_rgb': self.color_rgb,
             'alignment': ALIGN_MAP.get(self.align_var.get(),
@@ -949,8 +1178,6 @@ class LevelFormatPanel:
 
 
 class BodyFormatPanel:
-    """正文格式面板。"""
-
     def __init__(self, parent):
         self.frame = ttk.LabelFrame(
             parent, text="正文格式（只应用到指定的正文范围内）")
@@ -963,7 +1190,8 @@ class BodyFormatPanel:
                         variable=self.enabled_var,
                         command=self._on_toggle).pack(side=tk.LEFT)
         ttk.Label(header,
-                  text="（需先右键标题行设置“正文开始”和“正文结束”）",
+                  text="（需先右键标题行设置“正文开始”和“正文结束”；"
+                       "若“正文结束”是最后一个标题，之后到文档末尾都算正文）",
                   foreground='#666').pack(side=tk.LEFT, padx=8)
 
         self.body = ttk.Frame(self.frame)
@@ -971,21 +1199,30 @@ class BodyFormatPanel:
 
         row1 = ttk.Frame(self.body)
         row1.pack(fill=tk.X, pady=2)
+
         ttk.Label(row1, text="字体").pack(side=tk.LEFT)
         self.font_var = tk.StringVar(value="宋体")
-        ttk.Entry(row1, textvariable=self.font_var, width=10).pack(
+        ttk.Combobox(row1, textvariable=self.font_var,
+                     values=FONT_PRESETS, width=14).pack(
             side=tk.LEFT, padx=(2, 6))
+
         ttk.Label(row1, text="字号").pack(side=tk.LEFT)
-        self.size_var = tk.IntVar(value=12)
-        ttk.Spinbox(row1, from_=8, to=72, textvariable=self.size_var,
-                    width=4).pack(side=tk.LEFT, padx=(2, 6))
+        self.size_var = tk.StringVar(value="小四")
+        ttk.Combobox(row1, textvariable=self.size_var,
+                     values=FONT_SIZE_PRESETS, width=8).pack(
+            side=tk.LEFT, padx=(2, 6))
+
         self.bold_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row1, text="加粗",
-                        variable=self.bold_var).pack(side=tk.LEFT, padx=(0, 6))
+                        variable=self.bold_var).pack(
+            side=tk.LEFT, padx=(0, 6))
+
         ttk.Label(row1, text="对齐").pack(side=tk.LEFT)
         self.align_var = tk.StringVar(value="两端对齐")
         ttk.Combobox(row1, textvariable=self.align_var, values=ALIGN_NAMES,
-                     width=7, state='readonly').pack(side=tk.LEFT, padx=(2, 6))
+                     width=7, state='readonly').pack(
+            side=tk.LEFT, padx=(2, 6))
+
         ttk.Label(row1, text="颜色").pack(side=tk.LEFT)
         self.color_rgb = (0, 0, 0)
         self.color_btn = tk.Button(row1, text="  ",
@@ -1048,7 +1285,11 @@ class BodyFormatPanel:
                 pass
             for sub in w.winfo_children():
                 try:
-                    sub.configure(state=state)
+                    if isinstance(sub, ttk.Combobox):
+                        sub.configure(state='normal' if enabled
+                                      else 'disabled')
+                    else:
+                        sub.configure(state=state)
                 except Exception:
                     pass
         if enabled:
@@ -1074,9 +1315,12 @@ class BodyFormatPanel:
             ls_val = int(self.ls_val_var.get())
         except (TypeError, ValueError):
             ls_val = 18
+        size_val = parse_font_size(self.size_var.get())
+        if size_val is None:
+            size_val = 12.0
         return {
             'font_name': self.font_var.get().strip(),
-            'font_size': int(self.size_var.get()),
+            'font_size': size_val,
             'bold': bool(self.bold_var.get()),
             'color_rgb': self.color_rgb,
             'alignment': ALIGN_MAP.get(self.align_var.get(),
@@ -1165,19 +1409,14 @@ class AddParagraphDialog:
         self.top.destroy()
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Word 标题识别、格式统一与重新编号工具")
+# =========================================================
+# Tab 1：标题处理
+# =========================================================
 
-        sw = root.winfo_screenwidth()
-        sh = root.winfo_screenheight()
-        w = min(1100, sw - 60)
-        h = min(820, sh - 90)
-        x = max(0, (sw - w) // 2)
-        y = max(0, (sh - h) // 2)
-        root.geometry(f"{w}x{h}+{x}+{y}")
-        root.minsize(880, 480)
+class App(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.root = self.winfo_toplevel()
 
         self.src_path = None
         self.all_paras = []
@@ -1189,20 +1428,17 @@ class App:
         self.numfmt_vars = {}
         self.num_enabled_vars = {}
 
-        # 识别选项
         self.include_table_var = tk.BooleanVar(value=True)
 
-        # 正文范围（标题段落索引）
         self.body_start_idx = None
         self.body_end_idx = None
 
-        # 正文格式面板
         self.body_panel = None
 
         self._build_ui()
 
     def _build_ui(self):
-        top = ttk.Frame(self.root)
+        top = ttk.Frame(self)
         top.pack(fill=tk.X, padx=8, pady=(6, 2))
 
         ttk.Button(top, text="选择 Word 文档",
@@ -1219,21 +1455,18 @@ class App:
         ttk.Button(top, text="移除选中",
                    command=self.remove_selected).pack(side=tk.LEFT, padx=4)
 
-        bottom = ttk.Frame(self.root)
+        bottom = ttk.Frame(self)
         bottom.pack(fill=tk.X, padx=8, pady=(2, 8), side=tk.BOTTOM)
 
-        ttk.Button(bottom, text="退出",
-                   command=self.root.quit).pack(side=tk.RIGHT, padx=4)
         ttk.Button(bottom, text="导出为新 Word 文件",
                    command=self.export).pack(side=tk.RIGHT, padx=4)
         ttk.Button(bottom, text="导出标题清单（Excel/文本）",
                    command=self.export_titles).pack(side=tk.RIGHT, padx=4)
 
-        scroll = ScrollableFrame(self.root)
+        scroll = ScrollableFrame(self)
         scroll.pack(fill=tk.BOTH, expand=True, padx=6, pady=2)
         body = scroll.inner
 
-        # ---------- 标题列表 ----------
         mid = ttk.LabelFrame(
             body,
             text="标题列表（点击第一列勾选/取消；双击级别或文字列修改；右键设置正文范围）")
@@ -1254,11 +1487,8 @@ class App:
         ttk.Button(quick, text="切换选中 (空格)", width=14,
                    command=self._toggle_selected).pack(side=tk.LEFT, padx=2)
 
-        ttk.Label(quick, text="Ctrl/Shift + 点击行可多选",
-                  foreground='#666').pack(side=tk.LEFT, padx=10)
-
-        # 正文范围状态条
-        self.body_range_var = tk.StringVar(value="正文范围：未设置（右键标题行可设置）")
+        self.body_range_var = tk.StringVar(
+            value="正文范围：未设置（右键标题行可设置）")
         ttk.Label(quick, textvariable=self.body_range_var,
                   foreground='#0066cc').pack(side=tk.LEFT, padx=10)
 
@@ -1287,7 +1517,6 @@ class App:
         self.tree.bind('<space>', self._on_space_key)
         self.tree.bind('<Button-3>', self._on_right_click)
 
-        # ---------- 处理模式 + 识别选项 ----------
         opt_wrap = ttk.Frame(body)
         opt_wrap.pack(fill=tk.X, padx=2, pady=4)
 
@@ -1313,7 +1542,6 @@ class App:
             variable=self.include_table_var).pack(
             side=tk.LEFT, padx=10, pady=2)
 
-        # ---------- 标题格式 + 编号模板 ----------
         paned = ttk.Frame(body)
         paned.pack(fill=tk.X, padx=2, pady=2)
 
@@ -1325,12 +1553,17 @@ class App:
         fmt_wrap = ttk.LabelFrame(
             left, text="按级别统一设置标题格式（每级可单独启用/禁用）")
         fmt_wrap.pack(fill=tk.X)
-        default_fonts = {1: ('黑体', 16, True), 2: ('楷体', 14, True),
-                         3: ('宋体', 12, False)}
+        default_fonts = {
+            1: ('黑体', '三号', True),
+            2: ('楷体', '四号', True),
+            3: ('宋体', '小四', False),
+        }
         for lvl in (1, 2, 3):
-            fn, fs, bd = default_fonts[lvl]
+            fn, fs_name, bd = default_fonts[lvl]
             self.format_panels[lvl] = LevelFormatPanel(fmt_wrap, lvl, {
-                'font_name': fn, 'font_size': fs, 'bold': bd,
+                'font_name': fn,
+                'font_size_name': fs_name,
+                'bold': bd,
                 'align': '左对齐', 'color_rgb': (0, 0, 0),
                 'space_before': 6 if lvl == 1 else 3,
                 'space_after': 6 if lvl == 1 else 3,
@@ -1384,10 +1617,9 @@ class App:
                   text="提示：编号为纯文本，直接写入标题前。",
                   foreground='#666').pack(anchor='w', padx=8, pady=(2, 4))
 
-        # ---------- 正文格式 ----------
         self.body_panel = BodyFormatPanel(body)
 
-    # ---------- 正文范围设置 ----------
+    # ---------- 正文范围 ----------
     def _update_body_range_label(self):
         start_text = '未设置'
         end_text = '未设置'
@@ -1401,8 +1633,16 @@ class App:
                 if it.get('index') == self.body_end_idx:
                     end_text = f"【{it.get('text', '')[:18]}】"
                     break
+
+        end_extra = ""
+        if self.body_end_idx is not None and self.items:
+            title_idxs = sorted([it['index'] for it in self.items
+                                 if it.get('is_title')])
+            if title_idxs and self.body_end_idx == title_idxs[-1]:
+                end_extra = "（延伸到文档末尾）"
+
         self.body_range_var.set(
-            f"正文范围：{start_text} → {end_text}")
+            f"正文范围：{start_text} → {end_text}{end_extra}")
 
     def _set_body_start(self, iid):
         vals = self.tree.item(iid, 'values')
@@ -1426,6 +1666,16 @@ class App:
 
     def _clear_body_range(self):
         self.body_start_idx = None
+        self.body_end_idx = None
+        self._update_body_range_label()
+        self.refresh_tree()
+
+    def _clear_body_start(self):
+        self.body_start_idx = None
+        self._update_body_range_label()
+        self.refresh_tree()
+
+    def _clear_body_end(self):
         self.body_end_idx = None
         self._update_body_range_label()
         self.refresh_tree()
@@ -1513,7 +1763,6 @@ class App:
         if iid and iid not in self.tree.selection():
             self.tree.selection_set(iid)
 
-        # 判断当前行是否已标记为起/止
         is_start = False
         is_end = False
         if iid:
@@ -1530,22 +1779,18 @@ class App:
         menu.add_separator()
 
         if is_start:
-            menu.add_command(
-                label="取消「正文开始」标记",
-                command=self._clear_body_start)
+            menu.add_command(label="取消「正文开始」标记",
+                             command=self._clear_body_start)
         else:
-            menu.add_command(
-                label="将选中行设为「正文开始」",
-                command=lambda: self._set_body_start(iid))
+            menu.add_command(label="将选中行设为「正文开始」",
+                             command=lambda: self._set_body_start(iid))
 
         if is_end:
-            menu.add_command(
-                label="取消「正文结束」标记",
-                command=self._clear_body_end)
+            menu.add_command(label="取消「正文结束」标记",
+                             command=self._clear_body_end)
         else:
-            menu.add_command(
-                label="将选中行设为「正文结束」",
-                command=lambda: self._set_body_end(iid))
+            menu.add_command(label="将选中行设为「正文结束」",
+                             command=lambda: self._set_body_end(iid))
 
         menu.add_separator()
         menu.add_command(label="清除正文范围",
@@ -1572,16 +1817,6 @@ class App:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
-
-    def _clear_body_start(self):
-        self.body_start_idx = None
-        self._update_body_range_label()
-        self.refresh_tree()
-
-    def _clear_body_end(self):
-        self.body_end_idx = None
-        self._update_body_range_label()
-        self.refresh_tree()
 
     def _set_level_for_selected(self, level):
         for iid in self._get_selected_iids():
@@ -1681,7 +1916,6 @@ class App:
                 item['source'] = src
             self.items.append(item)
 
-        # 标题列表变了，正文范围标记失效
         self.body_start_idx = None
         self.body_end_idx = None
         self._update_body_range_label()
@@ -1795,7 +2029,6 @@ class App:
                 it['is_title'] = False
                 it['level'] = None
                 it['source'] = ''
-        # 正文标记可能失效
         if self.body_start_idx in remove_idx:
             self.body_start_idx = None
         if self.body_end_idx in remove_idx:
@@ -1921,7 +2154,6 @@ class App:
         if self.body_panel is not None and self.body_panel.is_enabled():
             body_format = self.body_panel.get_settings()
 
-        # 校验：如果启用正文格式，必须设置正文范围
         if body_format:
             if self.body_start_idx is None or self.body_end_idx is None:
                 messagebox.showwarning(
@@ -1932,12 +2164,18 @@ class App:
                     "请右键标题行，选择「将选中行设为『正文开始』」和\n"
                     "「将选中行设为『正文结束』」。")
                 return
-            if self.body_start_idx >= self.body_end_idx:
-                messagebox.showwarning(
-                    "提示",
-                    "「正文开始」标题必须位于「正文结束」标题之前。\n"
-                    "请重新设置。")
-                return
+
+            title_idxs = sorted([t['index'] for t in title_list])
+            is_last_title = (title_idxs and
+                             self.body_end_idx == title_idxs[-1])
+
+            if not is_last_title:
+                if self.body_start_idx >= self.body_end_idx:
+                    messagebox.showwarning(
+                        "提示",
+                        "「正文开始」标题必须位于「正文结束」标题之前。\n"
+                        "请重新设置。")
+                    return
 
         if not num_levels and not fmt_levels and not body_format:
             messagebox.showwarning(
@@ -1961,7 +2199,13 @@ class App:
 
         body_range = None
         if body_format:
-            body_range = (self.body_start_idx, self.body_end_idx)
+            start_idx = self.body_start_idx
+            end_idx = self.body_end_idx
+            title_idxs = sorted([t['index'] for t in title_list])
+            if title_idxs and end_idx == title_idxs[-1]:
+                body_range = (start_idx, None)
+            else:
+                body_range = (start_idx, end_idx)
 
         def work(progress_cb):
             export_document(
@@ -1979,8 +2223,12 @@ class App:
                         else "只重新编号")
             range_txt = ""
             if body_range:
-                range_txt = (f"\n  正文范围：段索引 "
-                             f"{body_range[0]} ~ {body_range[1]}")
+                if body_range[1] is None:
+                    range_txt = (f"\n  正文范围：段索引 "
+                                 f"{body_range[0]} 之后（延伸到文档末尾）")
+                else:
+                    range_txt = (f"\n  正文范围：段索引 "
+                                 f"{body_range[0]} ~ {body_range[1]}")
             messagebox.showinfo(
                 "完成",
                 f"[{mode_txt}]\n"
@@ -2021,14 +2269,218 @@ class App:
             messagebox.showerror("错误", f"导出失败：{e}")
 
 
+# =========================================================
+# Tab 2：表格提取到 Excel
+# =========================================================
+
+class TableExtractApp(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.root = self.winfo_toplevel()
+
+        self.word_path = None
+        self.excel_path = None
+        self.columns = []
+        self.rows = []
+
+        self._build_ui()
+
+    def _build_ui(self):
+        wrap = ttk.LabelFrame(self, text="文件选择")
+        wrap.pack(fill=tk.X, padx=8, pady=8)
+
+        row1 = ttk.Frame(wrap)
+        row1.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(row1, text="选择 Word 文档",
+                   command=self.select_word).pack(side=tk.LEFT)
+        self.word_label = ttk.Label(
+            row1, text="未选择", foreground='#555',
+            width=MAX_FILE_DISPLAY_CHARS + 2, anchor='w')
+        self.word_label.pack(side=tk.LEFT, padx=6)
+
+        row2 = ttk.Frame(wrap)
+        row2.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(row2, text="选择输出 Excel",
+                   command=self.select_excel).pack(side=tk.LEFT)
+        self.excel_label = ttk.Label(
+            row2, text="未选择", foreground='#555',
+            width=MAX_FILE_DISPLAY_CHARS + 2, anchor='w')
+        self.excel_label.pack(side=tk.LEFT, padx=6)
+
+        ops = ttk.Frame(self)
+        ops.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Button(ops, text="提取预览",
+                   command=self.extract).pack(side=tk.LEFT)
+        ttk.Button(ops, text="提取并导出 Excel",
+                   command=self.extract_and_export).pack(side=tk.LEFT, padx=6)
+        ttk.Button(ops, text="清空",
+                   command=self.clear).pack(side=tk.LEFT, padx=6)
+
+        self.status_var = tk.StringVar(value="就绪")
+        ttk.Label(ops, textvariable=self.status_var,
+                  foreground='#0066cc').pack(side=tk.LEFT, padx=12)
+
+        info = ttk.LabelFrame(self, text="提取规则")
+        info.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(
+            info, justify='left',
+            text=(
+                "· 表格最左侧列为 Excel 的列名称，紧挨它的第一列内容为对应数据\n"
+                "· 若表格最左侧右边有多个列或行，只取第一列、第一行的数据\n"
+                "· 多个表格的列名相同时，写在同列下；每个表格占 Excel 的一行\n"
+                "· 单格表格：按 \"列名: 内容\" 解析；内容可以跨多行，直到\n"
+                "  遇到下一个 \"列名:\" 或单元格内出现标题段落时结束。"),
+            foreground='#444'
+        ).pack(anchor='w', padx=8, pady=6)
+
+        mid = ttk.LabelFrame(self, text="提取结果预览")
+        mid.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+
+        self.preview_tree = ttk.Treeview(mid, show='headings')
+        self.preview_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT,
+                               padx=4, pady=4)
+        sb_y = ttk.Scrollbar(mid, orient='vertical',
+                             command=self.preview_tree.yview)
+        sb_y.pack(side=tk.RIGHT, fill=tk.Y)
+        sb_x = ttk.Scrollbar(mid, orient='horizontal',
+                             command=self.preview_tree.xview)
+        sb_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.preview_tree.configure(yscrollcommand=sb_y.set,
+                                    xscrollcommand=sb_x.set)
+
+    def select_word(self):
+        path = filedialog.askopenfilename(
+            title="选择 Word 文档",
+            filetypes=[("Word 文档", "*.docx"), ("所有文件", "*.*")])
+        if path:
+            self.word_path = path
+            self.word_label.config(text=truncate_path(path))
+
+    def select_excel(self):
+        path = filedialog.asksaveasfilename(
+            title="选择输出 Excel 文件",
+            defaultextension=".xlsx",
+            filetypes=[("Excel 文件", "*.xlsx")])
+        if path:
+            self.excel_path = path
+            self.excel_label.config(text=truncate_path(path))
+
+    def extract(self):
+        if not self.word_path:
+            messagebox.showwarning("提示", "请先选择 Word 文档")
+            return
+        try:
+            cols, rows = extract_tables_from_word(self.word_path)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"提取失败：{e}")
+            return
+
+        self.columns = cols
+        self.rows = rows
+        self._refresh_preview()
+        self.status_var.set(
+            f"提取完成：{len(self.rows)} 行，{len(self.columns)} 列")
+
+    def extract_and_export(self):
+        if not self.word_path:
+            messagebox.showwarning("提示", "请先选择 Word 文档")
+            return
+
+        if not self.excel_path:
+            path = filedialog.asksaveasfilename(
+                title="另存为 Excel",
+                defaultextension=".xlsx",
+                filetypes=[("Excel 文件", "*.xlsx")])
+            if not path:
+                return
+            self.excel_path = path
+            self.excel_label.config(text=truncate_path(path))
+
+        try:
+            cols, rows = extract_tables_from_word(self.word_path)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"提取失败：{e}")
+            return
+
+        self.columns = cols
+        self.rows = rows
+        self._refresh_preview()
+
+        if not self.columns:
+            messagebox.showwarning("提示", "未提取到任何表格内容")
+            self.status_var.set("未提取到任何内容")
+            return
+
+        try:
+            export_tables_to_excel(self.columns, self.rows, self.excel_path)
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"导出失败：{e}")
+            return
+
+        self.status_var.set(
+            f"已导出：{len(self.rows)} 行，{len(self.columns)} 列")
+        messagebox.showinfo(
+            "完成",
+            f"已提取 {len(self.rows)} 行、{len(self.columns)} 列。\n"
+            f"输出文件：\n{self.excel_path}")
+
+    def _refresh_preview(self):
+        self.preview_tree.delete(*self.preview_tree.get_children())
+        if not self.columns:
+            self.preview_tree['columns'] = ()
+            return
+        self.preview_tree['columns'] = self.columns
+        for col in self.columns:
+            self.preview_tree.heading(col, text=str(col))
+            self.preview_tree.column(col, width=140, anchor='w')
+        for r in self.rows:
+            values = [str(r.get(c, '')) for c in self.columns]
+            self.preview_tree.insert('', tk.END, values=values)
+
+    def clear(self):
+        self.preview_tree.delete(*self.preview_tree.get_children())
+        self.preview_tree['columns'] = ()
+        self.columns = []
+        self.rows = []
+        self.status_var.set("已清空")
+
+
+# =========================================================
+# 入口
+# =========================================================
+
 def main():
     root = tk.Tk()
+    root.title("Word 工具集")
+
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    w = min(1150, sw - 60)
+    h = min(820, sh - 90)
+    x = max(0, (sw - w) // 2)
+    y = max(0, (sh - h) // 2)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+    root.minsize(900, 500)
+
     try:
         style = ttk.Style()
         style.theme_use('clam')
     except Exception:
         pass
-    App(root)
+
+    nb = ttk.Notebook(root)
+    nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+    tab1 = App(nb)
+    nb.add(tab1, text="  标题处理  ")
+
+    tab2 = TableExtractApp(nb)
+    nb.add(tab2, text="  表格提取到 Excel  ")
+
     root.mainloop()
 
 
